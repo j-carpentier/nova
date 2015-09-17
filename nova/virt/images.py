@@ -21,14 +21,14 @@ Handling of VM disk images.
 
 import os
 
-from oslo.config import cfg
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_utils import fileutils
 
 from nova import exception
-from nova.image import glance
-from nova.openstack.common import fileutils
-from nova.openstack.common.gettextutils import _
+from nova.i18n import _, _LE
+from nova import image
 from nova.openstack.common import imageutils
-from nova.openstack.common import log as logging
 from nova import utils
 
 LOG = logging.getLogger(__name__)
@@ -41,17 +41,28 @@ image_opts = [
 
 CONF = cfg.CONF
 CONF.register_opts(image_opts)
+IMAGE_API = image.API()
 
 
 def qemu_img_info(path):
     """Return an object containing the parsed output from qemu-img info."""
     # TODO(mikal): this code should not be referring to a libvirt specific
     # flag.
+    # NOTE(sirp): The config option import must go here to avoid an import
+    # cycle
+    CONF.import_opt('images_type', 'nova.virt.libvirt.imagebackend',
+                    group='libvirt')
     if not os.path.exists(path) and CONF.libvirt.images_type != 'rbd':
-        return imageutils.QemuImgInfo()
+        msg = (_("Path does not exist %(path)s") % {'path': path})
+        raise exception.InvalidDiskInfo(reason=msg)
 
     out, err = utils.execute('env', 'LC_ALL=C', 'LANG=C',
                              'qemu-img', 'info', path)
+    if not out:
+        msg = (_("Failed to run qemu-img info on %(path)s : %(error)s") %
+               {'path': path, 'error': err})
+        raise exception.InvalidDiskInfo(reason=msg)
+
     return imageutils.QemuImgInfo(out)
 
 
@@ -62,14 +73,12 @@ def convert_image(source, dest, out_format, run_as_root=False):
 
 
 def fetch(context, image_href, path, _user_id, _project_id, max_size=0):
-    # TODO(vish): Improve context handling and add owner and auth data
-    #             when it is added to glance.  Right now there is no
-    #             auth checking in glance, so we assume that access was
-    #             checked before we got here.
-    (image_service, image_id) = glance.get_remote_image_service(context,
-                                                                image_href)
     with fileutils.remove_path_on_error(path):
-        image_service.download(context, image_id, dst_path=path)
+        IMAGE_API.download(context, image_href, dest_path=path)
+
+
+def get_info(context, image_href):
+    return IMAGE_API.get(context, image_href)
 
 
 def fetch_to_raw(context, image_href, path, user_id, project_id, max_size=0):
@@ -102,12 +111,13 @@ def fetch_to_raw(context, image_href, path, user_id, project_id, max_size=0):
         # irrespective of whether the base image was prepared or not.
         disk_size = data.virtual_size
         if max_size and max_size < disk_size:
-            msg = _('%(base)s virtual size %(disk_size)s '
-                    'larger than flavor root disk size %(size)s')
-            LOG.error(msg % {'base': path,
-                             'disk_size': disk_size,
-                             'size': max_size})
-            raise exception.FlavorDiskTooSmall()
+            LOG.error(_LE('%(base)s virtual size %(disk_size)s '
+                          'larger than flavor root disk size %(size)s'),
+                      {'base': path,
+                       'disk_size': disk_size,
+                       'size': max_size})
+            raise exception.FlavorDiskSmallerThanImage(
+                flavor_size=max_size, image_size=disk_size)
 
         if fmt != "raw" and CONF.force_raw_images:
             staged = "%s.converted" % path

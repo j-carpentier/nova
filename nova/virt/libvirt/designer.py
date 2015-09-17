@@ -19,8 +19,12 @@ This module provides helper APIs for populating the config.py
 classes based on common operational needs / policies
 """
 
+import six
 
-def set_vif_guest_frontend_config(conf, mac, model, driver):
+from nova.pci import utils as pci_utils
+
+
+def set_vif_guest_frontend_config(conf, mac, model, driver, queues=None):
     """Populate a LibvirtConfigGuestInterface instance
     with guest frontend details.
     """
@@ -29,6 +33,8 @@ def set_vif_guest_frontend_config(conf, mac, model, driver):
         conf.model = model
     if driver is not None:
         conf.driver_name = driver
+    if queues is not None:
+        conf.vhost_queues = queues
 
 
 def set_vif_host_backend_bridge_config(conf, brname, tapname=None):
@@ -39,7 +45,6 @@ def set_vif_host_backend_bridge_config(conf, brname, tapname=None):
     conf.source_dev = brname
     if tapname:
         conf.target_dev = tapname
-    conf.script = ""
 
 
 def set_vif_host_backend_ethernet_config(conf, tapname):
@@ -89,30 +94,73 @@ def set_vif_host_backend_802qbg_config(conf, devname, managerid,
         conf.target_dev = tapname
 
 
-def set_vif_host_backend_802qbh_config(conf, devname, profileid,
+def set_vif_host_backend_802qbh_config(conf, net_type, devname, profileid,
                                        tapname=None):
     """Populate a LibvirtConfigGuestInterface instance
     with host backend details for an 802.1qbh device.
     """
 
-    conf.net_type = "direct"
-    conf.source_dev = devname
-    conf.source_mode = "vepa"
+    conf.net_type = net_type
+    if net_type == 'direct':
+        conf.source_mode = 'passthrough'
+        conf.source_dev = pci_utils.get_ifname_by_pci_address(devname)
+        conf.driver_name = 'vhost'
+    else:
+        conf.source_dev = devname
+        conf.model = None
     conf.vporttype = "802.1Qbh"
     conf.add_vport_param("profileid", profileid)
     if tapname:
         conf.target_dev = tapname
 
 
-def set_vif_host_backend_direct_config(conf, devname):
+def set_vif_host_backend_hw_veb(conf, net_type, devname, vlan,
+                                tapname=None):
+    """Populate a LibvirtConfigGuestInterface instance
+    with host backend details for an device that supports hardware
+    virtual ethernet bridge.
+    """
+
+    conf.net_type = net_type
+    if net_type == 'direct':
+        conf.source_mode = 'passthrough'
+        conf.source_dev = pci_utils.get_ifname_by_pci_address(devname)
+        conf.driver_name = 'vhost'
+    else:
+        conf.source_dev = devname
+        conf.model = None
+        conf.vlan = vlan
+    if tapname:
+        conf.target_dev = tapname
+
+
+def set_vif_host_backend_ib_hostdev_config(conf, pci_slot):
+    """Populate a LibvirtConfigGuestInterface instance
+    with hostdev Interface.
+    """
+    conf.domain, conf.bus, conf.slot, conf.function = (
+        pci_utils.get_pci_address_fields(pci_slot))
+
+
+def set_vif_host_backend_direct_config(conf, devname, mode="passthrough"):
     """Populate a LibvirtConfigGuestInterface instance
     with direct Interface.
     """
 
     conf.net_type = "direct"
-    conf.source_mode = "passthrough"
+    conf.source_mode = mode
     conf.source_dev = devname
     conf.model = "virtio"
+
+
+def set_vif_host_backend_vhostuser_config(conf, mode, path):
+    """Populate a LibvirtConfigGuestInterface instance
+    with host backend details for vhostuser socket.
+    """
+    conf.net_type = "vhostuser"
+    conf.vhostuser_type = "unix"
+    conf.vhostuser_mode = mode
+    conf.vhostuser_path = path
 
 
 def set_vif_bandwidth_config(conf, inst_type):
@@ -124,7 +172,7 @@ def set_vif_bandwidth_config(conf, inst_type):
     bandwidth_items = ['vif_inbound_average', 'vif_inbound_peak',
         'vif_inbound_burst', 'vif_outbound_average', 'vif_outbound_peak',
         'vif_outbound_burst']
-    for key, value in inst_type.get('extra_specs', {}).iteritems():
+    for key, value in six.iteritems(inst_type.get('extra_specs', {})):
         scope = key.split(':')
         if len(scope) > 1 and scope[0] == 'quota':
             if scope[1] in bandwidth_items:

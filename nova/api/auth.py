@@ -16,27 +16,31 @@ Common Auth Middleware.
 
 """
 
-from oslo.config import cfg
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_middleware import request_id
+from oslo_serialization import jsonutils
 import webob.dec
 import webob.exc
 
 from nova import context
-from nova.openstack.common.gettextutils import _
-from nova.openstack.common import jsonutils
-from nova.openstack.common import log as logging
-from nova.openstack.common.middleware import request_id
+from nova.i18n import _
 from nova import wsgi
 
 
 auth_opts = [
     cfg.BoolOpt('api_rate_limit',
                 default=False,
-                help=('Whether to use per-user rate limiting for the api. '
-                      'This option is only used by v2 api. Rate limiting '
-                      'is removed from v3 api.')),
+                help='Whether to use per-user rate limiting for the api. '
+                     'This option is only used by v2 api. Rate limiting '
+                     'is removed from v2.1 api.'),
     cfg.StrOpt('auth_strategy',
                default='keystone',
-               help='The strategy to use for auth: noauth or keystone.'),
+               help='''
+The strategy to use for auth: keystone or noauth2. noauth2 is designed for
+testing only, as it does no actual credential checking. noauth2 provides
+administrative credentials only if 'admin' is specified as the username.
+'''),
     cfg.BoolOpt('use_forwarded_for',
                 default=False,
                 help='Treat X-Forwarded-For as the canonical remote address. '
@@ -60,23 +64,22 @@ def _load_pipeline(loader, pipeline):
 
 def pipeline_factory(loader, global_conf, **local_conf):
     """A paste pipeline replica that keys off of auth_strategy."""
+
     pipeline = local_conf[CONF.auth_strategy]
     if not CONF.api_rate_limit:
         limit_name = CONF.auth_strategy + '_nolimit'
         pipeline = local_conf.get(limit_name, pipeline)
     pipeline = pipeline.split()
-    # NOTE (Alex Xu): This is just for configuration file compatibility.
-    # If the configuration file still contains 'ratelimit_v3', just ignore it.
-    # We will remove this code at next release (J)
-    if 'ratelimit_v3' in pipeline:
-        LOG.warn(_('ratelimit_v3 is removed from v3 api.'))
-        pipeline.remove('ratelimit_v3')
     return _load_pipeline(loader, pipeline)
 
 
-def pipeline_factory_v3(loader, global_conf, **local_conf):
+def pipeline_factory_v21(loader, global_conf, **local_conf):
     """A paste pipeline replica that keys off of auth_strategy."""
     return _load_pipeline(loader, local_conf[CONF.auth_strategy].split())
+
+
+# NOTE(oomichi): This pipeline_factory_v3 is for passing check-grenade-dsvm.
+pipeline_factory_v3 = pipeline_factory_v21
 
 
 class InjectContext(wsgi.Middleware):
@@ -134,6 +137,10 @@ class NovaKeystoneContext(wsgi.Middleware):
                 raise webob.exc.HTTPInternalServerError(
                           _('Invalid service catalog json.'))
 
+        # NOTE(jamielennox): This is a full auth plugin set by auth_token
+        # middleware in newer versions.
+        user_auth_plugin = req.environ.get('keystone.token_auth')
+
         ctx = context.RequestContext(user_id,
                                      project_id,
                                      user_name=user_name,
@@ -142,7 +149,8 @@ class NovaKeystoneContext(wsgi.Middleware):
                                      auth_token=auth_token,
                                      remote_address=remote_address,
                                      service_catalog=service_catalog,
-                                     request_id=req_id)
+                                     request_id=req_id,
+                                     user_auth_plugin=user_auth_plugin)
 
         req.environ['nova.context'] = ctx
         return self.application
@@ -150,12 +158,5 @@ class NovaKeystoneContext(wsgi.Middleware):
     def _get_roles(self, req):
         """Get the list of roles."""
 
-        if 'X_ROLES' in req.headers:
-            roles = req.headers.get('X_ROLES', '')
-        else:
-            # Fallback to deprecated role header:
-            roles = req.headers.get('X_ROLE', '')
-            if roles:
-                LOG.warn(_("Sourcing roles from deprecated X-Role HTTP "
-                           "header"))
+        roles = req.headers.get('X_ROLES', '')
         return [r.strip() for r in roles.split(',')]

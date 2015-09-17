@@ -15,9 +15,10 @@
 
 
 import operator
+
+from oslo_serialization import jsonutils
 import six
 
-from nova.openstack.common import jsonutils
 from nova.scheduler import filters
 
 

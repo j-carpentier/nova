@@ -24,13 +24,15 @@ import sys
 if sys.platform == 'win32':
     import wmi
 
-from nova.openstack.common.gettextutils import _
-from nova.openstack.common import units
+from xml.etree import ElementTree
+
+from oslo_utils import units
+
+from nova.i18n import _
 from nova.virt.hyperv import constants
 from nova.virt.hyperv import vhdutils
 from nova.virt.hyperv import vmutils
 from nova.virt.hyperv import vmutilsv2
-from xml.etree import ElementTree
 
 
 VHDX_BAT_ENTRY_SIZE = 8
@@ -67,6 +69,10 @@ class VHDUtilsV2(vhdutils.VHDUtils):
                          max_internal_size=max_internal_size)
 
     def create_differencing_vhd(self, path, parent_path):
+        # Although this method can take a size argument in case of VHDX
+        # images, avoid it as the underlying Win32 is currently not
+        # resizing the disk properly. This can be reconsidered once the
+        # Win32 issue is fixed.
         parent_vhd_info = self.get_vhd_info(parent_path)
         self._create_vhd(self._VHD_TYPE_DIFFERENCING,
                          parent_vhd_info["Format"],
@@ -93,14 +99,18 @@ class VHDUtilsV2(vhdutils.VHDUtils):
         image_man_svc = self._conn.Msvm_ImageManagementService()[0]
         vhd_info_xml = self._get_vhd_info_xml(image_man_svc, child_vhd_path)
 
-        # Can't use ".//PROPERTY[@NAME='ParentPath']/VALUE" due to
-        # compatibility requirements with Python 2.6
         et = ElementTree.fromstring(vhd_info_xml)
-        for item in et.findall("PROPERTY"):
-            name = item.attrib["NAME"]
-            if name == 'ParentPath':
-                item.find("VALUE").text = parent_vhd_path
-                break
+        item = et.find(".//PROPERTY[@NAME='ParentPath']/VALUE")
+        if item is not None:
+            item.text = parent_vhd_path
+        else:
+            msg = (_("Failed to reconnect image %(child_vhd_path)s to "
+                     "parent %(parent_vhd_path)s. The child image has no "
+                     "parent path property.") %
+                   {'child_vhd_path': child_vhd_path,
+                    'parent_vhd_path': parent_vhd_path})
+            raise vmutils.HyperVException(msg)
+
         vhd_info_xml = ElementTree.tostring(et)
 
         (job_path, ret_val) = image_man_svc.SetVirtualHardDiskSettingData(
@@ -114,13 +124,18 @@ class VHDUtilsV2(vhdutils.VHDUtils):
 
     def get_internal_vhd_size_by_file_size(self, vhd_path,
                                            new_vhd_file_size):
-        """VHDX Size = Header (1 MB)
-                        + Log
-                        + Metadata Region
-                        + BAT
-                        + Payload Blocks
-            Chunk size = maximum number of bytes described by a SB block
-                       = 2 ** 23 * LogicalSectorSize
+        """Get internal size of a VHD according to new VHD file size.
+
+        VHDX Size = Header (1MB) + Log + Metadata Region + BAT + Payload Blocks
+
+        The chunk size is the maximum number of bytes described by a SB
+        block.
+
+        Chunk size = 2^{23} * LogicalSectorSize
+
+        :param str vhd_path: VHD file path
+        :param new_vhd_file_size: Size of the new VHD file.
+        :return: Internal VHD size according to new VHD file size.
         """
         vhd_format = self.get_vhd_format(vhd_path)
         if vhd_format == constants.DISK_FORMAT_VHD:
@@ -131,8 +146,9 @@ class VHDUtilsV2(vhdutils.VHDUtils):
             vhd_info = self.get_vhd_info(vhd_path)
             vhd_type = vhd_info['Type']
             if vhd_type == self._VHD_TYPE_DIFFERENCING:
-                raise vmutils.HyperVException(_("Differencing VHDX images "
-                                                "are not supported"))
+                vhd_parent = self.get_vhd_parent_path(vhd_path)
+                return self.get_internal_vhd_size_by_file_size(vhd_parent,
+                    new_vhd_file_size)
             else:
                 try:
                     with open(vhd_path, 'rb') as f:
@@ -211,7 +227,12 @@ class VHDUtilsV2(vhdutils.VHDUtils):
         et = ElementTree.fromstring(vhd_info_xml)
         for item in et.findall("PROPERTY"):
             name = item.attrib["NAME"]
-            value_text = item.find("VALUE").text
+            value_item = item.find("VALUE")
+            if value_item is None:
+                value_text = None
+            else:
+                value_text = value_item.text
+
             if name in ["Path", "ParentPath"]:
                 vhd_info_dict[name] = value_text
             elif name in ["BlockSize", "LogicalSectorSize",

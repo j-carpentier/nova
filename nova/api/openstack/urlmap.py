@@ -13,11 +13,21 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import paste.urlmap
 import re
-import urllib2
+
+from oslo_log import log as logging
+import paste.urlmap
+import six
+
+if six.PY3:
+    from urllib import request as urllib2
+else:
+    import urllib2
 
 from nova.api.openstack import wsgi
+
+
+LOG = logging.getLogger(__name__)
 
 
 _quoted_string_re = r'"[^"\\]*(?:\\.[^"\\]*)*"'
@@ -88,7 +98,7 @@ def parse_options_header(value):
         return '', {}
 
     parts = _tokenize(';' + value)
-    name = parts.next()[0]
+    name = next(parts)[0]
     extra = dict(parts)
     return name, extra
 
@@ -126,14 +136,6 @@ class Accept(object):
                     best_match = content_mask
 
         return best_content_type, best_params
-
-    def content_type_params(self, best_content_type):
-        """Find parameters in Accept header for given content type."""
-        for content_type, params in self._content_types:
-            if best_content_type == content_type:
-                return params
-
-        return {}
 
     def _match_mask(self, mask, content_type):
         if '*' not in mask:
@@ -194,7 +196,7 @@ class URLMap(paste.urlmap.URLMap):
         parts = path_info.rsplit('.', 1)
         if len(parts) > 1:
             possible_type = 'application/' + parts[1]
-            if possible_type in wsgi.SUPPORTED_CONTENT_TYPES:
+            if possible_type in wsgi.get_supported_content_types():
                 mime_type = possible_type
 
         parts = path_info.split('/')
@@ -255,7 +257,7 @@ class URLMap(paste.urlmap.URLMap):
         # 2) Content-Type header (eg application/json;version=1.1)
         # 3) Accept header (eg application/json;q=0.8;version=1.1)
 
-        supported_content_types = list(wsgi.SUPPORTED_CONTENT_TYPES)
+        supported_content_types = list(wsgi.get_supported_content_types())
 
         mime_type, app, app_url = self._path_strategy(host, port, path_info)
 
@@ -288,5 +290,6 @@ class URLMap(paste.urlmap.URLMap):
             environ['nova.best_content_type'] = mime_type
             return app(environ, start_response)
 
+        LOG.debug('Could not find application for %s', environ['PATH_INFO'])
         environ['paste.urlmap_object'] = self
         return self.not_found_application(environ, start_response)

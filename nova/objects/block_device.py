@@ -12,15 +12,17 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from oslo_log import log as logging
+
 from nova import block_device
+from nova.cells import opts as cells_opts
 from nova.cells import rpcapi as cells_rpcapi
 from nova import db
 from nova import exception
+from nova.i18n import _
+from nova import objects
 from nova.objects import base
 from nova.objects import fields
-from nova.objects import instance
-from nova.openstack.common.gettextutils import _
-from nova.openstack.common import log as logging
 
 
 LOG = logging.getLogger(__name__)
@@ -35,19 +37,38 @@ def _expected_cols(expected_attrs):
                  if attr in _BLOCK_DEVICE_OPTIONAL_JOINED_FIELD]
 
 
-class BlockDeviceMapping(base.NovaPersistentObject, base.NovaObject):
+# TODO(berrange): Remove NovaObjectDictCompat
+@base.NovaObjectRegistry.register
+class BlockDeviceMapping(base.NovaPersistentObject, base.NovaObject,
+                         base.NovaObjectDictCompat):
     # Version 1.0: Initial version
     # Version 1.1: Add instance_uuid to get_by_volume_id method
-    VERSION = '1.1'
+    # Version 1.2: Instance version 1.14
+    # Version 1.3: Instance version 1.15
+    # Version 1.4: Instance version 1.16
+    # Version 1.5: Instance version 1.17
+    # Version 1.6: Instance version 1.18
+    # Version 1.7: Add update_or_create method
+    # Version 1.8: Instance version 1.19
+    # Version 1.9: Instance version 1.20
+    # Version 1.10: Changed source_type field to BlockDeviceSourceTypeField.
+    # Version 1.11: Changed destination_type field to
+    #               BlockDeviceDestinationTypeField.
+    # Version 1.12: Changed device_type field to BlockDeviceTypeField.
+    # Version 1.13: Instance version 1.21
+    # Version 1.14: Instance version 1.22
+    # Version 1.15: Instance version 1.23
+    VERSION = '1.15'
 
     fields = {
         'id': fields.IntegerField(),
         'instance_uuid': fields.UUIDField(),
         'instance': fields.ObjectField('Instance', nullable=True),
-        'source_type': fields.StringField(nullable=True),
-        'destination_type': fields.StringField(nullable=True),
+        'source_type': fields.BlockDeviceSourceTypeField(nullable=True),
+        'destination_type': fields.BlockDeviceDestinationTypeField(
+                                nullable=True),
         'guest_format': fields.StringField(nullable=True),
-        'device_type': fields.StringField(nullable=True),
+        'device_type': fields.BlockDeviceTypeField(nullable=True),
         'disk_bus': fields.StringField(nullable=True),
         'boot_index': fields.IntegerField(nullable=True),
         'device_name': fields.StringField(nullable=True),
@@ -60,6 +81,13 @@ class BlockDeviceMapping(base.NovaPersistentObject, base.NovaObject):
         'connection_info': fields.StringField(nullable=True),
     }
 
+    obj_relationships = {
+        'instance': [('1.0', '1.13'), ('1.2', '1.14'), ('1.3', '1.15'),
+                     ('1.4', '1.16'), ('1.5', '1.17'), ('1.6', '1.18'),
+                     ('1.8', '1.19'), ('1.9', '1.20'), ('1.13', '1.21'),
+                     ('1.14', '1.22'), ('1.15', '1.23')],
+    }
+
     @staticmethod
     def _from_db_object(context, block_device_obj,
                         db_block_device, expected_attrs=None):
@@ -70,17 +98,36 @@ class BlockDeviceMapping(base.NovaPersistentObject, base.NovaObject):
                 continue
             block_device_obj[key] = db_block_device[key]
         if 'instance' in expected_attrs:
-            my_inst = instance.Instance()
-            instance.Instance._from_db_object(
-                    context, my_inst, db_block_device['instance'])
+            my_inst = objects.Instance(context)
+            my_inst._from_db_object(context, my_inst,
+                                    db_block_device['instance'])
             block_device_obj.instance = my_inst
 
         block_device_obj._context = context
         block_device_obj.obj_reset_changes()
         return block_device_obj
 
-    @base.remotable
-    def create(self, context):
+    def _create(self, context, update_or_create=False):
+        """Create the block device record in the database.
+
+        In case the id field is set on the object, and if the instance is set
+        raise an ObjectActionError. Resets all the changes on the object.
+
+        Returns None
+
+        :param context: security context used for database calls
+        :param update_or_create: consider existing block devices for the
+                instance based on the device name and swap, and only update
+                the ones that match. Normally only used when creating the
+                instance for the first time.
+        """
+        cell_type = cells_opts.get_cell_type()
+        if cell_type == 'api':
+            raise exception.ObjectActionError(
+                    action='create',
+                    reason='BlockDeviceMapping cannot be '
+                           'created in the API cell.')
+
         if self.obj_attr_is_set('id'):
             raise exception.ObjectActionError(action='create',
                                               reason='already created')
@@ -88,27 +135,50 @@ class BlockDeviceMapping(base.NovaPersistentObject, base.NovaObject):
         if 'instance' in updates:
             raise exception.ObjectActionError(action='create',
                                               reason='instance assigned')
-        updates.pop('id', None)
 
-        db_bdm = db.block_device_mapping_create(context, updates, legacy=False)
-        cells_api = cells_rpcapi.CellsAPI()
-        cells_api.bdm_update_or_create_at_top(context, db_bdm, create=True)
+        cells_create = update_or_create or None
+        if update_or_create:
+            db_bdm = db.block_device_mapping_update_or_create(
+                    context, updates, legacy=False)
+        else:
+            db_bdm = db.block_device_mapping_create(
+                    context, updates, legacy=False)
+
         self._from_db_object(context, self, db_bdm)
+        # NOTE(alaski): bdms are looked up by instance uuid and device_name
+        # so if we sync up with no device_name an entry will be created that
+        # will not be found on a later update_or_create call and a second bdm
+        # create will occur.
+        if cell_type == 'compute' and db_bdm.get('device_name') is not None:
+            cells_api = cells_rpcapi.CellsAPI()
+            cells_api.bdm_update_or_create_at_top(
+                    context, self, create=cells_create)
 
     @base.remotable
-    def destroy(self, context):
+    def create(self):
+        self._create(self._context)
+
+    @base.remotable
+    def update_or_create(self):
+        self._create(self._context, update_or_create=True)
+
+    @base.remotable
+    def destroy(self):
         if not self.obj_attr_is_set('id'):
             raise exception.ObjectActionError(action='destroy',
                                               reason='already destroyed')
-        db.block_device_mapping_destroy(context, self.id)
+        db.block_device_mapping_destroy(self._context, self.id)
         delattr(self, base.get_attrname('id'))
-        cells_api = cells_rpcapi.CellsAPI()
-        cells_api.bdm_destroy_at_top(context, self.instance_uuid,
-                                     device_name=self.device_name,
-                                     volume_id=self.volume_id)
+
+        cell_type = cells_opts.get_cell_type()
+        if cell_type == 'compute':
+            cells_api = cells_rpcapi.CellsAPI()
+            cells_api.bdm_destroy_at_top(self._context, self.instance_uuid,
+                                         device_name=self.device_name,
+                                         volume_id=self.volume_id)
 
     @base.remotable
-    def save(self, context):
+    def save(self):
         updates = self.obj_get_changes()
         if 'instance' in updates:
             raise exception.ObjectActionError(action='save',
@@ -116,9 +186,21 @@ class BlockDeviceMapping(base.NovaPersistentObject, base.NovaObject):
         updates.pop('id', None)
         updated = db.block_device_mapping_update(self._context, self.id,
                                                  updates, legacy=False)
-        cells_api = cells_rpcapi.CellsAPI()
-        cells_api.bdm_update_or_create_at_top(context, updated)
-        self._from_db_object(context, self, updated)
+        if not updated:
+            raise exception.BDMNotFound(id=self.id)
+        self._from_db_object(self._context, self, updated)
+        cell_type = cells_opts.get_cell_type()
+        if cell_type == 'compute':
+            create = False
+            # NOTE(alaski): If the device name has just been set this bdm
+            # likely does not exist in the parent cell and we should create it.
+            # If this is a modification of the device name we should update
+            # rather than create which is why None is used here instead of True
+            if 'device_name' in updates:
+                create = None
+            cells_api = cells_rpcapi.CellsAPI()
+            cells_api.bdm_update_or_create_at_top(self._context, self,
+                    create=create)
 
     @base.remotable_classmethod
     def get_by_volume_id(cls, context, volume_id,
@@ -144,11 +226,12 @@ class BlockDeviceMapping(base.NovaPersistentObject, base.NovaObject):
 
     @property
     def is_volume(self):
-        return self.destination_type == 'volume'
+        return (self.destination_type ==
+                    fields.BlockDeviceDestinationType.VOLUME)
 
     @property
     def is_image(self):
-        return self.source_type == 'image'
+        return self.source_type == fields.BlockDeviceSourceType.IMAGE
 
     def get_image_mapping(self):
         return block_device.BlockDeviceDict(self).get_image_mapping()
@@ -167,24 +250,42 @@ class BlockDeviceMapping(base.NovaPersistentObject, base.NovaObject):
                    'name': self.obj_name(),
                    'uuid': self.uuid,
                    })
-        self.instance = instance.Instance.get_by_uuid(self._context,
-                                                      self.instance_uuid)
+        self.instance = objects.Instance.get_by_uuid(self._context,
+                                                     self.instance_uuid)
         self.obj_reset_changes(fields=['instance'])
 
 
+@base.NovaObjectRegistry.register
 class BlockDeviceMappingList(base.ObjectListBase, base.NovaObject):
     # Version 1.0: Initial version
     # Version 1.1: BlockDeviceMapping <= version 1.1
     # Version 1.2: Added use_slave to get_by_instance_uuid
-    VERSION = '1.2'
+    # Version 1.3: BlockDeviceMapping <= version 1.2
+    # Version 1.4: BlockDeviceMapping <= version 1.3
+    # Version 1.5: BlockDeviceMapping <= version 1.4
+    # Version 1.6: BlockDeviceMapping <= version 1.5
+    # Version 1.7: BlockDeviceMapping <= version 1.6
+    # Version 1.8: BlockDeviceMapping <= version 1.7
+    # Version 1.9: BlockDeviceMapping <= version 1.8
+    # Version 1.10: BlockDeviceMapping <= version 1.9
+    # Version 1.11: BlockDeviceMapping <= version 1.10
+    # Version 1.12: BlockDeviceMapping <= version 1.11
+    # Version 1.13: BlockDeviceMapping <= version 1.12
+    # Version 1.14: BlockDeviceMapping <= version 1.13
+    # Version 1.15: BlockDeviceMapping <= version 1.14
+    # Version 1.16: BlockDeviceMapping <= version 1.15
+    VERSION = '1.16'
 
     fields = {
         'objects': fields.ListOfObjectsField('BlockDeviceMapping'),
     }
-    child_versions = {
-        '1.0': '1.0',
-        '1.1': '1.1',
-        '1.2': '1.1',
+    obj_relationships = {
+        'objects': [('1.0', '1.0'), ('1.1', '1.1'), ('1.2', '1.1'),
+                    ('1.3', '1.2'), ('1.4', '1.3'), ('1.5', '1.4'),
+                    ('1.6', '1.5'), ('1.7', '1.6'), ('1.8', '1.7'),
+                    ('1.9', '1.8'), ('1.10', '1.9'), ('1.11', '1.10'),
+                    ('1.12', '1.11'), ('1.13', '1.12'), ('1.14', '1.13'),
+                    ('1.15', '1.14'), ('1.16', '1.15')],
     }
 
     @base.remotable_classmethod
@@ -192,35 +293,23 @@ class BlockDeviceMappingList(base.ObjectListBase, base.NovaObject):
         db_bdms = db.block_device_mapping_get_all_by_instance(
                 context, instance_uuid, use_slave=use_slave)
         return base.obj_make_list(
-                context, cls(), BlockDeviceMapping, db_bdms or [])
+                context, cls(), objects.BlockDeviceMapping, db_bdms or [])
 
     def root_bdm(self):
         try:
-            return (bdm_obj for bdm_obj in self if bdm_obj.is_root).next()
+            return next(bdm_obj for bdm_obj in self if bdm_obj.is_root)
         except StopIteration:
             return
 
-    def root_metadata(self, context, image_api, volume_api):
-        root_bdm = self.root_bdm()
-        if not root_bdm:
-            return {}
-
-        if root_bdm.is_volume:
-            try:
-                volume = volume_api.get(context, root_bdm.volume_id)
-                return volume.get('volume_image_metadata', {})
-            except Exception:
-                raise exception.InvalidBDMVolume(id=root_bdm.id)
-        elif root_bdm.is_image:
-            try:
-                image_meta = image_api.show(context, root_bdm.image_id)
-                return image_meta.get('properties', {})
-            except Exception:
-                raise exception.InvalidBDMImage(id=root_bdm.id)
-        else:
-            return {}
-
 
 def block_device_make_list(context, db_list, **extra_args):
-    return base.obj_make_list(context, BlockDeviceMappingList(),
-                              BlockDeviceMapping, db_list, **extra_args)
+    return base.obj_make_list(context,
+                              objects.BlockDeviceMappingList(context),
+                              objects.BlockDeviceMapping, db_list,
+                              **extra_args)
+
+
+def block_device_make_list_from_dicts(context, bdm_dicts_list):
+    bdm_objects = [objects.BlockDeviceMapping(context=context, **bdm)
+                   for bdm in bdm_dicts_list]
+    return BlockDeviceMappingList(objects=bdm_objects)

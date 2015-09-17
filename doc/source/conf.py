@@ -28,26 +28,15 @@ sys.path.insert(0, os.path.abspath('./'))
 # extensions coming with Sphinx (named 'sphinx.ext.*') or your custom ones.
 
 extensions = ['sphinx.ext.autodoc',
-              'sphinx.ext.intersphinx',
               'ext.nova_todo',
               'sphinx.ext.coverage',
-              'sphinx.ext.pngmath',
-              'sphinx.ext.ifconfig',
               'sphinx.ext.graphviz',
               'oslosphinx',
+              "ext.support_matrix",
+              'sphinxcontrib.seqdiag',
               ]
 
 todo_include_todos = True
-
-# Add any paths that contain templates here, relative to this directory.
-# Changing the path so that the Hudson build output contains GA code
-# and the source docs do not contain the code so local, offline sphinx builds
-# are "clean."
-templates_path = []
-if os.getenv('HUDSON_PUBLISH_DOCS'):
-    templates_path = ['_ga', '_templates']
-else:
-    templates_path = ['_templates']
 
 # The suffix of source filenames.
 source_suffix = '.rst'
@@ -82,16 +71,13 @@ version = version_info.version_string()
 # Else, today_fmt is used as the format for a strftime call.
 #today_fmt = '%B %d, %Y'
 
-# List of documents that shouldn't be included in the build.
-unused_docs = [
-    'api_ext/rst_extension_template',
-    'vmwareapi_readme',
-    'installer',
+# A list of glob-style patterns that should be excluded when looking for
+# source files. They are matched against the source file names relative to the
+# source directory, using slashes as directory separators on all platforms.
+exclude_patterns = [
+    'api/nova.wsgi.nova-*',
+    'api/nova.tests.*',
 ]
-
-# List of directories, relative to source directory, that shouldn't be searched
-# for source files.
-exclude_trees = []
 
 # The reST default role (used for this markup: `text`) to use
 # for all documents.
@@ -130,6 +116,8 @@ man_pages = [
      u'Cloud controller fabric', [u'OpenStack'], 1),
     ('man/nova-api', 'nova-api', u'Cloud controller fabric',
      [u'OpenStack'], 1),
+    ('man/nova-cells', 'nova-cells', u'Cloud controller fabric',
+     [u'OpenStack'], 1),
     ('man/nova-cert', 'nova-cert', u'Cloud controller fabric',
      [u'OpenStack'], 1),
     ('man/nova-compute', 'nova-compute', u'Cloud controller fabric',
@@ -140,6 +128,8 @@ man_pages = [
      [u'OpenStack'], 1),
     ('man/nova-dhcpbridge', 'nova-dhcpbridge', u'Cloud controller fabric',
      [u'OpenStack'], 1),
+    ('man/nova-idmapshift', 'nova-idmapshift', u'Cloud controller fabric',
+     [u'OpenStack'], 1),
     ('man/nova-manage', 'nova-manage', u'Cloud controller fabric',
      [u'OpenStack'], 1),
     ('man/nova-network', 'nova-network', u'Cloud controller fabric',
@@ -147,6 +137,8 @@ man_pages = [
     ('man/nova-novncproxy', 'nova-novncproxy', u'Cloud controller fabric',
      [u'OpenStack'], 1),
     ('man/nova-spicehtml5proxy', 'nova-spicehtml5proxy', u'Cloud controller fabric',
+     [u'OpenStack'], 1),
+    ('man/nova-serialproxy', 'nova-serialproxy', u'Cloud controller fabric',
      [u'OpenStack'], 1),
     ('man/nova-objectstore', 'nova-objectstore', u'Cloud controller fabric',
      [u'OpenStack'], 1),
@@ -269,8 +261,3 @@ latex_documents = [
 
 # If false, no module index is generated.
 #latex_use_modindex = True
-
-
-# Example configuration for intersphinx: refer to the Python standard library.
-intersphinx_mapping = {'python': ('http://docs.python.org/', None),
-                       'swift': ('http://swift.openstack.org', None)}

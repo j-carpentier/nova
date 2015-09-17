@@ -12,8 +12,8 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 #
-#============================================================================
-#
+
+
 # Parts of this file are based upon xmlrpclib.py, the XML-RPC client
 # interface included in the Python distribution.
 #
@@ -55,14 +55,14 @@ import uuid
 from xml.sax import saxutils
 import zlib
 
-import pprint
+from oslo_log import log as logging
+from oslo_serialization import jsonutils
+from oslo_utils import timeutils
+from oslo_utils import units
+import six
 
 from nova import exception
-from nova.openstack.common.gettextutils import _
-from nova.openstack.common import jsonutils
-from nova.openstack.common import log as logging
-from nova.openstack.common import timeutils
-from nova.openstack.common import units
+from nova.i18n import _
 from nova.virt.xenapi.client import session as xenapi_session
 
 
@@ -72,13 +72,6 @@ _CLASSES = ['host', 'network', 'session', 'pool', 'SR', 'VBD',
 _db_content = {}
 
 LOG = logging.getLogger(__name__)
-
-
-def log_db_contents(msg=None):
-    text = msg or ""
-    content = pprint.pformat(_db_content)
-    LOG.debug("%(text)s: _db_content => %(content)s",
-              {'text': text, 'content': content})
 
 
 def reset():
@@ -207,11 +200,15 @@ def after_VDI_create(vdi_ref, vdi_rec):
     vdi_rec.setdefault('VBDs', [])
 
 
-def create_vbd(vm_ref, vdi_ref, userdevice=0):
+def create_vbd(vm_ref, vdi_ref, userdevice=0, other_config=None):
+    if other_config is None:
+        other_config = {}
+
     vbd_rec = {'VM': vm_ref,
                'VDI': vdi_ref,
                'userdevice': str(userdevice),
-               'currently_attached': False}
+               'currently_attached': False,
+               'other_config': other_config}
     vbd_ref = _create_object('VBD', vbd_rec)
     after_VBD_create(vbd_ref, vbd_rec)
     return vbd_ref
@@ -223,6 +220,7 @@ def after_VBD_create(vbd_ref, vbd_rec):
     """
     vbd_rec['currently_attached'] = False
     vbd_rec['device'] = ''
+    vbd_rec.setdefault('other_config', {})
 
     vm_ref = vbd_rec['VM']
     vm_rec = _db_content['VM'][vm_ref]
@@ -237,6 +235,14 @@ def after_VBD_create(vbd_ref, vbd_rec):
         vdi_rec['VBDs'].append(vbd_ref)
 
 
+def after_VIF_create(vif_ref, vif_rec):
+    """Create backref from VM to VIF when VIF is created.
+    """
+    vm_ref = vif_rec['VM']
+    vm_rec = _db_content['VM'][vm_ref]
+    vm_rec['VIFs'].append(vif_ref)
+
+
 def after_VM_create(vm_ref, vm_rec):
     """Create read-only fields in the VM record."""
     vm_rec.setdefault('domid', -1)
@@ -246,6 +252,7 @@ def after_VM_create(vm_ref, vm_rec):
     vm_rec.setdefault('memory_dynamic_max', str(8 * units.Gi))
     vm_rec.setdefault('VCPUs_max', str(4))
     vm_rec.setdefault('VBDs', [])
+    vm_rec.setdefault('VIFs', [])
     vm_rec.setdefault('resident_on', '')
 
 
@@ -464,8 +471,7 @@ class Failure(Exception):
             return "XenAPI Fake Failure: %s" % str(self.details)
 
     def _details_map(self):
-        return dict([(str(i), self.details[i])
-                     for i in range(len(self.details))])
+        return {str(i): self.details[i] for i in range(len(self.details))}
 
 
 class SessionBase(object):
@@ -536,9 +542,7 @@ class SessionBase(object):
 
     def SR_introduce(self, _1, sr_uuid, label, desc, type, content_type,
                      shared, sm_config):
-        ref = None
-        rec = None
-        for ref, rec in _db_content['SR'].iteritems():
+        for ref, rec in six.iteritems(_db_content['SR']):
             if rec.get('uuid') == sr_uuid:
                 # make forgotten = 0 and return ref
                 _db_content['SR'][ref]['forgotten'] = 0
@@ -622,7 +626,7 @@ class SessionBase(object):
         return self.VDI_copy(_1, vdi_to_clone_ref, sr_ref)
 
     def host_compute_free_memory(self, _1, ref):
-        #Always return 12GB available
+        # Always return 12GB available
         return 12 * units.Gi
 
     def _plugin_agent_version(self, method, args):
@@ -667,13 +671,47 @@ class SessionBase(object):
     _plugin_migration_move_vhds_into_sr = _plugin_noop
 
     def _plugin_xenhost_host_data(self, method, args):
-            return jsonutils.dumps({'host_memory': {'total': 10,
-                                                    'overhead': 20,
-                                                    'free': 30,
-                                                    'free-computed': 40},
-                                    'host_hostname': 'fake-xenhost',
-                                    'host_cpu_info': {'cpu_count': 50},
-                                    })
+        return jsonutils.dumps({
+            'host_memory': {'total': 10,
+                            'overhead': 20,
+                            'free': 30,
+                            'free-computed': 40},
+            'host_uuid': 'fb97583b-baa1-452d-850e-819d95285def',
+            'host_name-label': 'fake-xenhost',
+            'host_name-description': 'Default install of XenServer',
+            'host_hostname': 'fake-xenhost',
+            'host_ip_address': '10.219.10.24',
+            'enabled': 'true',
+            'host_capabilities': ['xen-3.0-x86_64',
+                                  'xen-3.0-x86_32p',
+                                  'hvm-3.0-x86_32',
+                                  'hvm-3.0-x86_32p',
+                                  'hvm-3.0-x86_64'],
+            'host_other-config': {
+                'agent_start_time': '1412774967.',
+                'iscsi_iqn': 'iqn.2014-10.org.example:39fa9ee3',
+                'boot_time': '1412774885.',
+            },
+            'host_cpu_info': {
+                'physical_features': '0098e3fd-bfebfbff-00000001-28100800',
+                'modelname': 'Intel(R) Xeon(R) CPU           X3430  @ 2.40GHz',
+                'vendor': 'GenuineIntel',
+                'features': '0098e3fd-bfebfbff-00000001-28100800',
+                'family': 6,
+                'maskable': 'full',
+                'cpu_count': 4,
+                'socket_count': '1',
+                'flags': 'fpu de tsc msr pae mce cx8 apic sep mtrr mca '
+                         'cmov pat clflush acpi mmx fxsr sse sse2 ss ht '
+                         'nx constant_tsc nonstop_tsc aperfmperf pni vmx '
+                         'est ssse3 sse4_1 sse4_2 popcnt hypervisor ida '
+                         'tpr_shadow vnmi flexpriority ept vpid',
+                'stepping': 5,
+                'model': 30,
+                'features_after_reboot': '0098e3fd-bfebfbff-00000001-28100800',
+                'speed': '2394.086'
+            },
+        })
 
     def _plugin_poweraction(self, method, args):
         return jsonutils.dumps({"power_action": method[5:]})
@@ -699,14 +737,14 @@ class SessionBase(object):
 
         """
         # Driver is not pciback
-        dev_bad1 = ["Slot:\t86:10.0", "Class:\t0604", "Vendor:\t10b5",
+        dev_bad1 = ["Slot:\t0000:86:10.0", "Class:\t0604", "Vendor:\t10b5",
                     "Device:\t8747", "Rev:\tba", "Driver:\tpcieport", "\n"]
         # Driver is pciback but vendor and device are bad
-        dev_bad2 = ["Slot:\t88:00.0", "Class:\t0300", "Vendor:\t0bad",
+        dev_bad2 = ["Slot:\t0000:88:00.0", "Class:\t0300", "Vendor:\t0bad",
                     "Device:\tcafe", "SVendor:\t10de", "SDevice:\t100d",
                     "Rev:\ta1", "Driver:\tpciback", "\n"]
         # Driver is pciback and vendor, device are used for matching
-        dev_good = ["Slot:\t87:00.0", "Class:\t0300", "Vendor:\t10de",
+        dev_good = ["Slot:\t0000:87:00.0", "Class:\t0300", "Vendor:\t10de",
                     "Device:\t11bf", "SVendor:\t10de", "SDevice:\t100d",
                     "Rev:\ta1", "Driver:\tpciback", "\n"]
 
@@ -1013,7 +1051,7 @@ class SessionBase(object):
 
     def _get_by_field(self, recs, k, v, return_singleton):
         result = []
-        for ref, rec in recs.iteritems():
+        for ref, rec in six.iteritems(recs):
             if rec.get(k) == v:
                 result.append(ref)
 
@@ -1032,7 +1070,7 @@ class FakeXenAPI(object):
 
 
 # Based upon _Method from xmlrpclib.
-class _Dispatcher:
+class _Dispatcher(object):
     def __init__(self, send, name):
         self.__send = send
         self.__name = name

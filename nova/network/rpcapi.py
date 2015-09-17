@@ -16,11 +16,11 @@
 Client side of the network RPC API.
 """
 
-from oslo.config import cfg
-from oslo import messaging
+from oslo_config import cfg
+import oslo_messaging as messaging
+from oslo_serialization import jsonutils
 
 from nova.objects import base as objects_base
-from nova.openstack.common import jsonutils
 from nova import rpc
 
 rpcapi_opts = [
@@ -46,45 +46,74 @@ class NetworkAPI(object):
 
     API version history:
 
-        1.0 - Initial version.
-        1.1 - Adds migrate_instance_[start|finish]
-        1.2 - Make migrate_instance_[start|finish] a little more flexible
-        1.3 - Adds fanout cast update_dns for multi_host networks
-        1.4 - Add get_backdoor_port()
-        1.5 - Adds associate
-        1.6 - Adds instance_uuid to _{dis,}associate_floating_ip
-        1.7 - Adds method get_floating_ip_pools to replace get_floating_pools
-        1.8 - Adds macs to allocate_for_instance
-        1.9 - Adds rxtx_factor to [add|remove]_fixed_ip, removes instance_uuid
-              from allocate_for_instance and instance_get_nw_info
+        * 1.0 - Initial version.
+        * 1.1 - Adds migrate_instance_[start|finish]
+        * 1.2 - Make migrate_instance_[start|finish] a little more flexible
+        * 1.3 - Adds fanout cast update_dns for multi_host networks
+        * 1.4 - Add get_backdoor_port()
+        * 1.5 - Adds associate
+        * 1.6 - Adds instance_uuid to _{dis,}associate_floating_ip
+        * 1.7 - Adds method get_floating_ip_pools to replace get_floating_pools
+        * 1.8 - Adds macs to allocate_for_instance
+        * 1.9 - Adds rxtx_factor to [add|remove]_fixed_ip, removes
+                instance_uuid from allocate_for_instance and
+                instance_get_nw_info
 
         ... Grizzly supports message version 1.9.  So, any changes to existing
         methods in 1.x after that point should be done such that they can
         handle the version_cap being set to 1.9.
 
-        1.10- Adds (optional) requested_networks to deallocate_for_instance
+        * 1.10- Adds (optional) requested_networks to deallocate_for_instance
 
         ... Havana supports message version 1.10.  So, any changes to existing
         methods in 1.x after that point should be done such that they can
         handle the version_cap being set to 1.10.
 
-        NOTE: remove unused method get_vifs_by_instance()
-        NOTE: remove unused method get_vif_by_mac_address()
-        NOTE: remove unused method get_network()
-        NOTE: remove unused method get_all_networks()
-        1.11 - Add instance to deallocate_for_instance().  Remove instance_id,
-               project_id, and host.
-        1.12 - Add instance to deallocate_fixed_ip()
+        * NOTE: remove unused method get_vifs_by_instance()
+        * NOTE: remove unused method get_vif_by_mac_address()
+        * NOTE: remove unused method get_network()
+        * NOTE: remove unused method get_all_networks()
+        * 1.11 - Add instance to deallocate_for_instance().
+                 Remove instance_id, project_id, and host.
+        * 1.12 - Add instance to deallocate_fixed_ip()
 
         ... Icehouse supports message version 1.12.  So, any changes to
         existing methods in 1.x after that point should be done such that they
         can handle the version_cap being set to 1.12.
+
+        * 1.13 - Convert allocate_for_instance()
+                 to use NetworkRequestList objects
+
+        ... Juno and Kilo supports message version 1.13.  So, any changes to
+        existing methods in 1.x after that point should be done such that they
+        can handle the version_cap being set to 1.13.
+
+        * NOTE: remove unused method get_floating_ips_by_fixed_address()
+        * NOTE: remove unused method get_instance_uuids_by_ip_filter()
+        * NOTE: remove unused method disassociate_network()
+        * NOTE: remove unused method get_fixed_ip()
+        * NOTE: remove unused method get_fixed_ip_by_address()
+        * NOTE: remove unused method get_floating_ip()
+        * NOTE: remove unused method get_floating_ip_pools()
+        * NOTE: remove unused method get_floating_ip_by_address()
+        * NOTE: remove unused method get_floating_ips_by_project()
+        * NOTE: remove unused method get_instance_id_by_floating_address()
+        * NOTE: remove unused method allocate_floating_ip()
+        * NOTE: remove unused method deallocate_floating_ip()
+        * NOTE: remove unused method associate_floating_ip()
+        * NOTE: remove unused method disassociate_floating_ip()
+        * NOTE: remove unused method associate()
+
+        * 1.14 - Add mac parameter to release_fixed_ip().
+        * 1.15 - Convert set_network_host() to use Network objects.
     '''
 
     VERSION_ALIASES = {
         'grizzly': '1.9',
         'havana': '1.10',
         'icehouse': '1.12',
+        'juno': '1.13',
+        'kilo': '1.13',
     }
 
     def __init__(self, topic=None):
@@ -106,68 +135,19 @@ class NetworkAPI(object):
         return self.client.call(ctxt, 'delete_network',
                                 uuid=uuid, fixed_range=fixed_range)
 
-    def disassociate_network(self, ctxt, network_uuid):
-        return self.client.call(ctxt, 'disassociate_network',
-                                network_uuid=network_uuid)
-
-    def get_fixed_ip(self, ctxt, id):
-        return self.client.call(ctxt, 'get_fixed_ip', id=id)
-
-    def get_fixed_ip_by_address(self, ctxt, address):
-        return self.client.call(ctxt, 'get_fixed_ip_by_address',
-                                address=address)
-
-    def get_floating_ip(self, ctxt, id):
-        return self.client.call(ctxt, 'get_floating_ip', id=id)
-
-    def get_floating_ip_pools(self, ctxt):
-        cctxt = self.client.prepare(version="1.7")
-        return cctxt.call(ctxt, 'get_floating_ip_pools')
-
-    def get_floating_ip_by_address(self, ctxt, address):
-        return self.client.call(ctxt, 'get_floating_ip_by_address',
-                                address=address)
-
-    def get_floating_ips_by_project(self, ctxt):
-        return self.client.call(ctxt, 'get_floating_ips_by_project')
-
-    def get_floating_ips_by_fixed_address(self, ctxt, fixed_address):
-        return self.client.call(ctxt, 'get_floating_ips_by_fixed_address',
-                                fixed_address=fixed_address)
-
-    def get_instance_id_by_floating_address(self, ctxt, address):
-        return self.client.call(ctxt, 'get_instance_id_by_floating_address',
-                                address=address)
-
-    def allocate_floating_ip(self, ctxt, project_id, pool, auto_assigned):
-        return self.client.call(ctxt, 'allocate_floating_ip',
-                                project_id=project_id, pool=pool,
-                                auto_assigned=auto_assigned)
-
-    def deallocate_floating_ip(self, ctxt, address, affect_auto_assigned):
-        return self.client.call(ctxt, 'deallocate_floating_ip',
-                                address=address,
-                                affect_auto_assigned=affect_auto_assigned)
-
-    def associate_floating_ip(self, ctxt, floating_address, fixed_address,
-                              affect_auto_assigned):
-        return self.client.call(ctxt, 'associate_floating_ip',
-                                floating_address=floating_address,
-                                fixed_address=fixed_address,
-                                affect_auto_assigned=affect_auto_assigned)
-
-    def disassociate_floating_ip(self, ctxt, address, affect_auto_assigned):
-        return self.client.call(ctxt, 'disassociate_floating_ip',
-                                address=address,
-                                affect_auto_assigned=affect_auto_assigned)
-
     def allocate_for_instance(self, ctxt, instance_id, project_id, host,
                               rxtx_factor, vpn, requested_networks, macs=None,
                               dhcp_options=None):
+        version = '1.13'
+        if not self.client.can_send_version(version):
+            version = '1.9'
+            if requested_networks:
+                requested_networks = requested_networks.as_tuples()
+
         if CONF.multi_host:
-            cctxt = self.client.prepare(version='1.9', server=host)
+            cctxt = self.client.prepare(version=version, server=host)
         else:
-            cctxt = self.client.prepare(version='1.9')
+            cctxt = self.client.prepare(version=version)
         return cctxt.call(ctxt, 'allocate_for_instance',
                           instance_id=instance_id, project_id=project_id,
                           host=host, rxtx_factor=rxtx_factor, vpn=vpn,
@@ -187,11 +167,11 @@ class NetworkAPI(object):
                 kwargs['requested_networks'] = requested_networks
             else:
                 version = '1.0'
-            kwargs['host'] = instance['host']
+            kwargs['host'] = instance.host
             kwargs['instance_id'] = instance.uuid
             kwargs['project_id'] = instance.project_id
         if CONF.multi_host:
-            cctxt = cctxt.prepare(server=instance['host'], version=version)
+            cctxt = cctxt.prepare(server=instance.host, version=version)
         return cctxt.call(ctxt, 'deallocate_for_instance', **kwargs)
 
     def add_fixed_ip_to_instance(self, ctxt, instance_id, rxtx_factor,
@@ -213,12 +193,6 @@ class NetworkAPI(object):
                                 project_id=project_id,
                                 network_uuid=network_uuid)
 
-    def associate(self, ctxt, network_uuid, associations):
-        cctxt = self.client.prepare(version='1.5')
-        return cctxt.call(ctxt, 'associate',
-                          network_uuid=network_uuid,
-                          associations=associations)
-
     def get_instance_nw_info(self, ctxt, instance_id, rxtx_factor, host,
                              project_id):
         cctxt = self.client.prepare(version='1.9')
@@ -228,10 +202,6 @@ class NetworkAPI(object):
 
     def validate_networks(self, ctxt, networks):
         return self.client.call(ctxt, 'validate_networks', networks=networks)
-
-    def get_instance_uuids_by_ip_filter(self, ctxt, filters):
-        return self.client.call(ctxt, 'get_instance_uuids_by_ip_filter',
-                                filters=filters)
 
     def get_dns_domains(self, ctxt):
         return self.client.call(ctxt, 'get_dns_domains')
@@ -275,9 +245,12 @@ class NetworkAPI(object):
                                 teardown=teardown)
 
     def set_network_host(self, ctxt, network_ref):
-        network_ref_p = jsonutils.to_primitive(network_ref)
-        return self.client.call(ctxt, 'set_network_host',
-                                network_ref=network_ref_p)
+        version = '1.15'
+        if not self.client.can_send_version(version):
+            version = '1.0'
+            network_ref = objects_base.obj_to_primitive(network_ref)
+        cctxt = self.client.prepare(version=version)
+        return cctxt.call(ctxt, 'set_network_host', network_ref=network_ref)
 
     def rpc_setup_network_on_host(self, ctxt, network_id, teardown, host):
         # NOTE(tr3buchet): the call is just to wait for completion
@@ -338,9 +311,15 @@ class NetworkAPI(object):
         cctxt = self.client.prepare(server=host)
         cctxt.cast(ctxt, 'lease_fixed_ip', address=address)
 
-    def release_fixed_ip(self, ctxt, address, host):
-        cctxt = self.client.prepare(server=host)
-        cctxt.cast(ctxt, 'release_fixed_ip', address=address)
+    def release_fixed_ip(self, ctxt, address, host, mac):
+        kwargs = {}
+        if self.client.can_send_version('1.14'):
+            version = '1.14'
+            kwargs['mac'] = mac
+        else:
+            version = '1.0'
+        cctxt = self.client.prepare(server=host, version=version)
+        cctxt.cast(ctxt, 'release_fixed_ip', address=address, **kwargs)
 
     def migrate_instance_start(self, ctxt, instance_uuid, rxtx_factor,
                                project_id, source_compute, dest_compute,

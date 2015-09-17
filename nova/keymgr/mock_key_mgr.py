@@ -28,12 +28,13 @@ this class.
 
 import array
 
+from oslo_log import log as logging
+from oslo_utils import uuidutils
+
 from nova import exception
+from nova.i18n import _LW
 from nova.keymgr import key
 from nova.keymgr import key_mgr
-from nova.openstack.common.gettextutils import _
-from nova.openstack.common import log as logging
-from nova.openstack.common import uuidutils
 from nova import utils
 
 
@@ -51,8 +52,8 @@ class MockKeyManager(key_mgr.KeyManager):
     """
 
     def __init__(self):
-        LOG.warn(_('This key manager is not suitable for use in production'
-                   ' deployments'))
+        LOG.warning(_LW('This key manager is not suitable for use in '
+                        'production deployments'))
 
         self.keys = {}
 

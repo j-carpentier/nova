@@ -18,16 +18,16 @@
 
 import time
 
-from oslo.config import cfg
-from oslo import messaging
+from oslo_config import cfg
+from oslo_log import log as logging
+import oslo_messaging as messaging
+from oslo_serialization import jsonutils
 
 from nova.cells import rpcapi as cells_rpcapi
 from nova.compute import rpcapi as compute_rpcapi
+from nova.i18n import _LI, _LW
 from nova import manager
-from nova.objects import instance as instance_obj
-from nova.openstack.common.gettextutils import _, _LW
-from nova.openstack.common import jsonutils
-from nova.openstack.common import log as logging
+from nova import objects
 from nova.openstack.common import memorycache
 
 
@@ -47,7 +47,7 @@ CONF.import_opt('enable', 'nova.cells.opts', group='cells')
 class ConsoleAuthManager(manager.Manager):
     """Manages token based authentication."""
 
-    target = messaging.Target(version='2.0')
+    target = messaging.Target(version='2.1')
 
     def __init__(self, scheduler_driver=None, *args, **kwargs):
         super(ConsoleAuthManager, self).__init__(service_name='consoleauth',
@@ -65,7 +65,8 @@ class ConsoleAuthManager(manager.Manager):
         return tokens
 
     def authorize_console(self, context, token, console_type, host, port,
-                          internal_access_path, instance_uuid):
+                          internal_access_path, instance_uuid,
+                          access_url=None):
 
         token_dict = {'token': token,
                       'instance_uuid': instance_uuid,
@@ -73,6 +74,7 @@ class ConsoleAuthManager(manager.Manager):
                       'host': host,
                       'port': port,
                       'internal_access_path': internal_access_path,
+                      'access_url': access_url,
                       'last_activity_at': time.time()}
         data = jsonutils.dumps(token_dict)
 
@@ -82,21 +84,20 @@ class ConsoleAuthManager(manager.Manager):
         if not self.mc.set(token.encode('UTF-8'),
                            data, CONF.console_token_ttl):
             LOG.warning(_LW("Token: %(token)s failed to save into memcached."),
-                            {'token': token})
+                        {'token': token})
         tokens = self._get_tokens_for_instance(instance_uuid)
+
         # Remove the expired tokens from cache.
-        for tok in tokens:
-            token_str = self.mc.get(tok.encode('UTF-8'))
-            if not token_str:
-                tokens.remove(tok)
+        tokens = [tok for tok in tokens if self.mc.get(tok.encode('UTF-8'))]
         tokens.append(token)
+
         if not self.mc.set(instance_uuid.encode('UTF-8'),
                            jsonutils.dumps(tokens)):
             LOG.warning(_LW("Instance: %(instance_uuid)s failed to save "
                             "into memcached"),
                         {'instance_uuid': instance_uuid})
 
-        LOG.audit(_("Received Token: %(token)s, %(token_dict)s"),
+        LOG.info(_LI("Received Token: %(token)s, %(token_dict)s"),
                   {'token': token, 'token_dict': token_dict})
 
     def _validate_token(self, context, token):
@@ -111,7 +112,7 @@ class ConsoleAuthManager(manager.Manager):
             return self.cells_rpcapi.validate_console_port(context,
                     instance_uuid, token['port'], token['console_type'])
 
-        instance = instance_obj.Instance.get_by_uuid(context, instance_uuid)
+        instance = objects.Instance.get_by_uuid(context, instance_uuid)
 
         return self.compute_rpcapi.validate_console_port(context,
                                             instance,
@@ -121,7 +122,7 @@ class ConsoleAuthManager(manager.Manager):
     def check_token(self, context, token):
         token_str = self.mc.get(token.encode('UTF-8'))
         token_valid = (token_str is not None)
-        LOG.audit(_("Checking Token: %(token)s, %(token_valid)s"),
+        LOG.info(_LI("Checking Token: %(token)s, %(token_valid)s"),
                   {'token': token, 'token_valid': token_valid})
         if token_valid:
             token = jsonutils.loads(token_str)

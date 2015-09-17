@@ -14,10 +14,12 @@
 
 from nova import db
 from nova import exception
+from nova import objects
 from nova.objects import base
 from nova.objects import fields
 
 
+@base.NovaObjectRegistry.register
 class VirtualInterface(base.NovaPersistentObject, base.NovaObject):
     # Version 1.0: Initial version
     VERSION = '1.0'
@@ -33,7 +35,7 @@ class VirtualInterface(base.NovaPersistentObject, base.NovaObject):
     @staticmethod
     def _from_db_object(context, vif, db_vif):
         for field in vif.fields:
-            vif[field] = db_vif[field]
+            setattr(vif, field, db_vif[field])
         vif._context = context
         vif.obj_reset_changes()
         return vif
@@ -64,36 +66,39 @@ class VirtualInterface(base.NovaPersistentObject, base.NovaObject):
             return cls._from_db_object(context, cls(), db_vif)
 
     @base.remotable
-    def create(self, context):
+    def create(self):
         if self.obj_attr_is_set('id'):
             raise exception.ObjectActionError(action='create',
                                               reason='already created')
         updates = self.obj_get_changes()
-        db_vif = db.virtual_interface_create(context, updates)
-        self._from_db_object(context, self, db_vif)
+        db_vif = db.virtual_interface_create(self._context, updates)
+        self._from_db_object(self._context, self, db_vif)
 
     @base.remotable_classmethod
     def delete_by_instance_uuid(cls, context, instance_uuid):
         db.virtual_interface_delete_by_instance(context, instance_uuid)
 
 
+@base.NovaObjectRegistry.register
 class VirtualInterfaceList(base.ObjectListBase, base.NovaObject):
     # Version 1.0: Initial version
     VERSION = '1.0'
     fields = {
         'objects': fields.ListOfObjectsField('VirtualInterface'),
     }
-    child_versions = {
-        '1.0': '1.0',
+    obj_relationships = {
+        'objects': [('1.0', '1.0')],
     }
 
     @base.remotable_classmethod
     def get_all(cls, context):
         db_vifs = db.virtual_interface_get_all(context)
-        return base.obj_make_list(context, cls(), VirtualInterface, db_vifs)
+        return base.obj_make_list(context, cls(context),
+                                  objects.VirtualInterface, db_vifs)
 
     @base.remotable_classmethod
     def get_by_instance_uuid(cls, context, instance_uuid, use_slave=False):
         db_vifs = db.virtual_interface_get_by_instance(context, instance_uuid,
                 use_slave=use_slave)
-        return base.obj_make_list(context, cls(), VirtualInterface, db_vifs)
+        return base.obj_make_list(context, cls(context),
+                                  objects.VirtualInterface, db_vifs)

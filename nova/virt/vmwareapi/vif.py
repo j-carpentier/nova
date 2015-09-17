@@ -15,14 +15,15 @@
 
 """VIF drivers for VMware."""
 
-from oslo.config import cfg
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_vmware import exceptions as vexc
+from oslo_vmware import vim_util as vutil
 
 from nova import exception
-from nova.openstack.common.gettextutils import _
-from nova.openstack.common import log as logging
-from nova.virt.vmwareapi import error_util
+from nova.i18n import _LW
+from nova.network import model
 from nova.virt.vmwareapi import network_util
-from nova.virt.vmwareapi import vim_util
 from nova.virt.vmwareapi import vm_util
 
 LOG = logging.getLogger(__name__)
@@ -114,20 +115,28 @@ def _get_network_ref_from_opaque(opaque_networks, integration_bridge, bridge):
                     'network-id': network['opaqueNetworkId'],
                     'network-name': network['opaqueNetworkName'],
                     'network-type': network['opaqueNetworkType']}
-    LOG.warning(_("No valid network found in %(opaque)s, from %(bridge)s "
-                  "or %(integration_bridge)s"),
+    LOG.warning(_LW("No valid network found in %(opaque)s, from %(bridge)s "
+                    "or %(integration_bridge)s"),
                 {'opaque': opaque_networks, 'bridge': bridge,
                  'integration_bridge': integration_bridge})
 
 
-def get_neutron_network(session, network_name, cluster, vif):
+def _get_opaque_network(session, cluster):
     host = vm_util.get_host_ref(session, cluster)
     try:
-        opaque = session._call_method(vim_util, "get_dynamic_property", host,
-                                      "HostSystem",
+        opaque = session._call_method(vutil,
+                                      "get_object_property",
+                                      host,
                                       "config.network.opaqueNetwork")
-    except error_util.InvalidPropertyException:
+    except vexc.InvalidPropertyException:
         opaque = None
+    return opaque
+
+
+def get_neutron_network(session, network_name, cluster, vif):
+    opaque = None
+    if vif['type'] != model.VIF_TYPE_DVS:
+        opaque = _get_opaque_network(session, cluster)
     if opaque:
         bridge = vif['network']['id']
         opaque_networks = opaque.HostOpaqueNetworkInfo
@@ -154,18 +163,33 @@ def get_network_ref(session, cluster, vif, is_neutron):
     return network_ref
 
 
+def get_vif_dict(session, cluster, vif_model, is_neutron, vif):
+    mac = vif['address']
+    name = vif['network']['bridge'] or CONF.vmware.integration_bridge
+    ref = get_network_ref(session, cluster, vif, is_neutron)
+    return {'network_name': name,
+            'mac_address': mac,
+            'network_ref': ref,
+            'iface_id': vif['id'],
+            'vif_model': vif_model}
+
+
 def get_vif_info(session, cluster, is_neutron, vif_model, network_info):
     vif_infos = []
-    if not network_info:
+    if network_info is None:
         return vif_infos
     for vif in network_info:
-        mac_address = vif['address']
-        net_name = vif['network']['bridge'] or CONF.vmware.integration_bridge
-        network_ref = get_network_ref(session, cluster, vif, is_neutron)
-        vif_infos.append({'network_name': net_name,
-                          'mac_address': mac_address,
-                          'network_ref': network_ref,
-                          'iface_id': vif['id'],
-                          'vif_model': vif_model
-                         })
+        vif_infos.append(get_vif_dict(session, cluster, vif_model,
+                         is_neutron, vif))
     return vif_infos
+
+
+def get_network_device(hardware_devices, mac_address):
+    """Return the network device with MAC 'mac_address'."""
+    if hardware_devices.__class__.__name__ == "ArrayOfVirtualDevice":
+        hardware_devices = hardware_devices.VirtualDevice
+    for device in hardware_devices:
+        if device.__class__.__name__ in vm_util.ALL_SUPPORTED_NETWORK_DEVICES:
+            if hasattr(device, 'macAddress'):
+                if device.macAddress == mac_address:
+                    return device

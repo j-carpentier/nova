@@ -13,8 +13,9 @@
 # under the License.
 """Support for mounting images with the loop device."""
 
-from nova.openstack.common.gettextutils import _
-from nova.openstack.common import log as logging
+from oslo_log import log as logging
+
+from nova.i18n import _, _LI
 from nova import utils
 from nova.virt.disk.mount import api
 
@@ -26,11 +27,12 @@ class LoopMount(api.Mount):
     mode = 'loop'
 
     def _inner_get_dev(self):
-        out, err = utils.trycmd('losetup', '--find', '--show', self.image,
+        out, err = utils.trycmd('losetup', '--find', '--show',
+                                self.image.path,
                                 run_as_root=True)
         if err:
             self.error = _('Could not attach image to loopback: %s') % err
-            LOG.info(_('Loop mount error: %s'), self.error)
+            LOG.info(_LI('Loop mount error: %s'), self.error)
             self.linked = False
             self.device = None
             return False

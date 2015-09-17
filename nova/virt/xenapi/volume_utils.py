@@ -22,11 +22,11 @@ import re
 import string
 
 from eventlet import greenthread
-from oslo.config import cfg
+from oslo_config import cfg
+from oslo_log import log as logging
 
 from nova import exception
-from nova.openstack.common.gettextutils import _
-from nova.openstack.common import log as logging
+from nova.i18n import _, _LE, _LW
 
 xenapi_volume_utils_opts = [
     cfg.IntOpt('introduce_vdi_retry_wait',
@@ -159,8 +159,8 @@ def introduce_vdi(session, sr_ref, vdi_uuid=None, target_lun=None):
             greenthread.sleep(CONF.xenserver.introduce_vdi_retry_wait)
             session.call_xenapi("SR.scan", sr_ref)
             vdi_ref = _get_vdi_ref(session, sr_ref, vdi_uuid, target_lun)
-    except session.XenAPI.Failure as exc:
-        LOG.exception(exc)
+    except session.XenAPI.Failure:
+        LOG.exception(_LE('Unable to introduce VDI on SR'))
         raise exception.StorageError(
                 reason=_('Unable to introduce VDI on SR %s') % sr_ref)
 
@@ -174,9 +174,8 @@ def introduce_vdi(session, sr_ref, vdi_uuid=None, target_lun=None):
     try:
         vdi_rec = session.call_xenapi("VDI.get_record", vdi_ref)
         LOG.debug(vdi_rec)
-        LOG.debug(type(vdi_rec))
-    except session.XenAPI.Failure as exc:
-        LOG.exception(exc)
+    except session.XenAPI.Failure:
+        LOG.exception(_LE('Unable to get record of VDI'))
         raise exception.StorageError(
                 reason=_('Unable to get record of VDI %s on') % vdi_ref)
 
@@ -197,8 +196,8 @@ def introduce_vdi(session, sr_ref, vdi_uuid=None, target_lun=None):
                                     vdi_rec['location'],
                                     vdi_rec['xenstore_data'],
                                     vdi_rec['sm_config'])
-    except session.XenAPI.Failure as exc:
-        LOG.exception(exc)
+    except session.XenAPI.Failure:
+        LOG.exception(_LE('Unable to introduce VDI for SR'))
         raise exception.StorageError(
                 reason=_('Unable to introduce VDI for SR %s') % sr_ref)
 
@@ -227,7 +226,7 @@ def purge_sr(session, sr_ref):
     for vdi_ref in vdi_refs:
         vbd_refs = session.call_xenapi("VDI.get_VBDs", vdi_ref)
         if vbd_refs:
-            LOG.warn(_('Cannot purge SR with referenced VDIs'))
+            LOG.warning(_LW('Cannot purge SR with referenced VDIs'))
             return
 
     forget_sr(session, sr_ref)
@@ -244,16 +243,16 @@ def _unplug_pbds(session, sr_ref):
     try:
         pbds = session.call_xenapi("SR.get_PBDs", sr_ref)
     except session.XenAPI.Failure as exc:
-        LOG.warn(_('Ignoring exception %(exc)s when getting PBDs'
-                   ' for %(sr_ref)s'), {'exc': exc, 'sr_ref': sr_ref})
+        LOG.warning(_LW('Ignoring exception %(exc)s when getting PBDs'
+                        ' for %(sr_ref)s'), {'exc': exc, 'sr_ref': sr_ref})
         return
 
     for pbd in pbds:
         try:
             session.call_xenapi("PBD.unplug", pbd)
         except session.XenAPI.Failure as exc:
-            LOG.warn(_('Ignoring exception %(exc)s when unplugging'
-                       ' PBD %(pbd)s'), {'exc': exc, 'pbd': pbd})
+            LOG.warning(_LW('Ignoring exception %(exc)s when unplugging'
+                            ' PBD %(pbd)s'), {'exc': exc, 'pbd': pbd})
 
 
 def get_device_number(mountpoint):
@@ -276,7 +275,7 @@ def _mountpoint_to_number(mountpoint):
     elif re.match('^[0-9]+$', mountpoint):
         return string.atoi(mountpoint, 10)
     else:
-        LOG.warn(_('Mountpoint cannot be translated: %s'), mountpoint)
+        LOG.warning(_LW('Mountpoint cannot be translated: %s'), mountpoint)
         return -1
 
 
@@ -295,10 +294,21 @@ def find_sr_from_vbd(session, vbd_ref):
     try:
         vdi_ref = session.call_xenapi("VBD.get_VDI", vbd_ref)
         sr_ref = session.call_xenapi("VDI.get_SR", vdi_ref)
-    except session.XenAPI.Failure as exc:
-        LOG.exception(exc)
+    except session.XenAPI.Failure:
+        LOG.exception(_LE('Unable to find SR from VBD'))
         raise exception.StorageError(
                 reason=_('Unable to find SR from VBD %s') % vbd_ref)
+    return sr_ref
+
+
+def find_sr_from_vdi(session, vdi_ref):
+    """Find the SR reference from the VDI reference."""
+    try:
+        sr_ref = session.call_xenapi("VDI.get_SR", vdi_ref)
+    except session.XenAPI.Failure:
+        LOG.exception(_LE('Unable to find SR from VDI'))
+        raise exception.StorageError(
+                reason=_('Unable to find SR from VDI %s') % vdi_ref)
     return sr_ref
 
 
@@ -315,3 +325,12 @@ def find_vbd_by_number(session, vm_ref, dev_number):
             except session.XenAPI.Failure:
                 msg = "Error looking up VBD %s for %s" % (vbd_ref, vm_ref)
                 LOG.debug(msg, exc_info=True)
+
+
+def is_booted_from_volume(session, vm_ref):
+    """Determine if the root device is a volume."""
+    vbd_ref = find_vbd_by_number(session, vm_ref, 0)
+    vbd_other_config = session.VBD.get_other_config(vbd_ref)
+    if vbd_other_config.get('osvol', False):
+        return True
+    return False

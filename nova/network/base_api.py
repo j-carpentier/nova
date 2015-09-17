@@ -16,13 +16,15 @@
 import functools
 import inspect
 
+from oslo_concurrency import lockutils
+from oslo_log import log as logging
+from oslo_utils import excutils
+
 from nova.db import base
 from nova import hooks
+from nova.i18n import _, _LE
 from nova.network import model as network_model
-from nova.objects import instance_info_cache as info_cache_obj
-from nova.openstack.common import excutils
-from nova.openstack.common.gettextutils import _
-from nova.openstack.common import log as logging
+from nova import objects
 
 
 LOG = logging.getLogger(__name__)
@@ -36,17 +38,19 @@ def update_instance_cache_with_nw_info(impl, context, instance,
             nw_info = None
         if nw_info is None:
             nw_info = impl._get_instance_nw_info(context, instance)
-        LOG.debug('Updating cache with info: %s', nw_info)
+
+        LOG.debug('Updating instance_info_cache with network_info: %s',
+                  nw_info, instance=instance)
+
         # NOTE(comstud): The save() method actually handles updating or
         # creating the instance.  We don't need to retrieve the object
         # from the DB first.
-        ic = info_cache_obj.InstanceInfoCache.new(context,
-                                                  instance['uuid'])
+        ic = objects.InstanceInfoCache.new(context, instance.uuid)
         ic.network_info = nw_info
         ic.save(update_cells=update_cells)
     except Exception:
         with excutils.save_and_reraise_exception():
-            LOG.exception(_('Failed storing info cache'), instance=instance)
+            LOG.exception(_LE('Failed storing info cache'), instance=instance)
 
 
 def refresh_cache(f):
@@ -58,7 +62,6 @@ def refresh_cache(f):
 
     @functools.wraps(f)
     def wrapper(self, context, *args, **kwargs):
-        res = f(self, context, *args, **kwargs)
         try:
             # get the instance from arguments (or raise ValueError)
             instance = kwargs.get('instance')
@@ -68,8 +71,12 @@ def refresh_cache(f):
             msg = _('instance is a required argument to use @refresh_cache')
             raise Exception(msg)
 
-        update_instance_cache_with_nw_info(self, context, instance,
-                                           nw_info=res)
+        with lockutils.lock('refresh_cache-%s' % instance.uuid):
+            # We need to call the wrapped function with the lock held to ensure
+            # that it can call _get_instance_nw_info safely.
+            res = f(self, context, *args, **kwargs)
+            update_instance_cache_with_nw_info(self, context, instance,
+                                               nw_info=res)
         # return the original function's return value
         return res
     return wrapper
@@ -82,7 +89,8 @@ class NetworkAPI(base.Base):
     """Base Network API for doing networking operations.
     New operations available on specific clients must be added here as well.
     """
-    def __init__(self, **kwargs):
+    def __init__(self, skip_policy_check=False, **kwargs):
+        self.skip_policy_check = skip_policy_check
         super(NetworkAPI, self).__init__(**kwargs)
 
     def get_all(self, context):
@@ -129,10 +137,6 @@ class NetworkAPI(base.Base):
         """Get floating ips by project."""
         raise NotImplementedError()
 
-    def get_floating_ips_by_fixed_address(self, context, fixed_address):
-        """Get floating ips by fixed address."""
-        raise NotImplementedError()
-
     def get_instance_id_by_floating_address(self, context, address):
         """Get instance id by floating address."""
         raise NotImplementedError()
@@ -154,6 +158,11 @@ class NetworkAPI(base.Base):
         """Removes (deallocates) a floating ip with address from a project."""
         raise NotImplementedError()
 
+    def disassociate_and_release_floating_ip(self, context, instance,
+                                           floating_ip):
+        """Removes (deallocates) and deletes the floating ip."""
+        raise NotImplementedError()
+
     def associate_floating_ip(self, context, instance,
                               floating_address, fixed_address,
                               affect_auto_assigned=False):
@@ -172,7 +181,7 @@ class NetworkAPI(base.Base):
         """Allocates all network structures for an instance.
 
         :param context: The request context.
-        :param instance: An Instance dict.
+        :param instance: nova.objects.instance.Instance object.
         :param vpn: A boolean, if True, indicate a vpn to access the instance.
         :param requested_networks: A dictionary of requested_networks,
             Optional value containing network_id, fixed_ip, and port_id.
@@ -231,6 +240,29 @@ class NetworkAPI(base.Base):
 
     def get_instance_nw_info(self, context, instance, **kwargs):
         """Returns all network info related to an instance."""
+        with lockutils.lock('refresh_cache-%s' % instance.uuid):
+            result = self._get_instance_nw_info(context, instance, **kwargs)
+            # NOTE(comstud): Don't update API cell with new info_cache every
+            # time we pull network info for an instance.  The periodic healing
+            # of info_cache causes too many cells messages.  Healing the API
+            # will happen separately.
+            update_instance_cache_with_nw_info(self, context, instance,
+                                               nw_info=result,
+                                               update_cells=False)
+        return result
+
+    def _get_instance_nw_info(self, context, instance, **kwargs):
+        """Template method, so a subclass can implement for neutron/network."""
+        raise NotImplementedError()
+
+    def create_pci_requests_for_sriov_ports(self, context,
+                                            pci_requests,
+                                            requested_networks):
+        """Check requested networks for any SR-IOV port request.
+
+        Create a PCI request object for each SR-IOV port, and add it to the
+        pci_requests object that contains a list of PCI request object.
+        """
         raise NotImplementedError()
 
     def validate_networks(self, context, requested_networks, num_instances):
@@ -239,12 +271,6 @@ class NetworkAPI(base.Base):
 
         Return the number of instances that can be successfully allocated
         with the requested network configuration.
-        """
-        raise NotImplementedError()
-
-    def get_instance_uuids_by_ip_filter(self, context, filters):
-        """Returns a list of dicts in the form of
-        {'instance_uuid': uuid, 'ip': ip} that matched the ip_filter
         """
         raise NotImplementedError()
 
@@ -300,3 +326,35 @@ class NetworkAPI(base.Base):
     def migrate_instance_finish(self, context, instance, migration):
         """Finish migrating the network of an instance."""
         raise NotImplementedError()
+
+    def setup_instance_network_on_host(self, context, instance, host):
+        """Setup network for specified instance on host.
+
+        :param context: The request context.
+        :param instance: nova.objects.instance.Instance object.
+        :param host: The host which network should be setup for instance.
+        """
+        raise NotImplementedError()
+
+    def cleanup_instance_network_on_host(self, context, instance, host):
+        """Cleanup network for specified instance on host.
+
+        :param context: The request context.
+        :param instance: nova.objects.instance.Instance object.
+        :param host: The host which network should be cleanup for instance.
+        """
+        raise NotImplementedError()
+
+    def update_instance_vnic_index(self, context, instance, vif, index):
+        """Update instance vnic index.
+
+        When the 'VNIC index' extension is supported this method will update
+        the vnic index of the instance on the port. A instance may have more
+        than one vnic.
+
+        :param context: The request context.
+        :param instance: nova.objects.instance.Instance object.
+        :param vif: The VIF in question.
+        :param index: The index on the instance for the VIF.
+        """
+        pass

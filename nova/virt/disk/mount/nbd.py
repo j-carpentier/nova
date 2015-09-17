@@ -18,10 +18,10 @@ import random
 import re
 import time
 
-from oslo.config import cfg
+from oslo_config import cfg
+from oslo_log import log as logging
 
-from nova.openstack.common.gettextutils import _
-from nova.openstack.common import log as logging
+from nova.i18n import _, _LE, _LI, _LW
 from nova import utils
 from nova.virt.disk.mount import api
 
@@ -54,14 +54,14 @@ class NbdMount(api.Mount):
                 if not os.path.exists('/var/lock/qemu-nbd-%s' % device):
                     return device
                 else:
-                    LOG.error(_('NBD error - previous umount did not cleanup '
-                              '/var/lock/qemu-nbd-%s.'), device)
-        LOG.warn(_('No free nbd devices'))
+                    LOG.error(_LE('NBD error - previous umount did not '
+                                  'cleanup /var/lock/qemu-nbd-%s.'), device)
+        LOG.warning(_LW('No free nbd devices'))
         return None
 
     def _allocate_nbd(self):
         if not os.path.exists('/sys/block/nbd0'):
-            LOG.error(_('nbd module not loaded'))
+            LOG.error(_LE('nbd module not loaded'))
             self.error = _('nbd unavailable: module not loaded')
             return None
 
@@ -83,12 +83,13 @@ class NbdMount(api.Mount):
         # NOTE(mikal): qemu-nbd will return an error if the device file is
         # already in use.
         LOG.debug('Get nbd device %(dev)s for %(imgfile)s',
-                  {'dev': device, 'imgfile': self.image})
-        _out, err = utils.trycmd('qemu-nbd', '-c', device, self.image,
+                  {'dev': device, 'imgfile': self.image.path})
+        _out, err = utils.trycmd('qemu-nbd', '-c', device,
+                                 self.image.path,
                                  run_as_root=True)
         if err:
             self.error = _('qemu-nbd error: %s') % err
-            LOG.info(_('NBD mount error: %s'), self.error)
+            LOG.info(_LI('NBD mount error: %s'), self.error)
             return False
 
         # NOTE(vish): this forks into another process, so give it a chance
@@ -101,14 +102,14 @@ class NbdMount(api.Mount):
             time.sleep(1)
         else:
             self.error = _('nbd device %s did not show up') % device
-            LOG.info(_('NBD mount error: %s'), self.error)
+            LOG.info(_LI('NBD mount error: %s'), self.error)
 
             # Cleanup
             _out, err = utils.trycmd('qemu-nbd', '-d', device,
                                      run_as_root=True)
             if err:
-                LOG.warn(_('Detaching from erroneous nbd device returned '
-                           'error: %s'), err)
+                LOG.warning(_LW('Detaching from erroneous nbd device returned '
+                                'error: %s'), err)
             return False
 
         self.error = ''

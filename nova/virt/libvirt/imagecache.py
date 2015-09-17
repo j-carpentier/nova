@@ -21,23 +21,23 @@ http://wiki.openstack.org/nova-image-cache-management.
 """
 
 import hashlib
-import json
 import os
 import re
 import time
 
-from oslo.config import cfg
+from oslo_concurrency import lockutils
+from oslo_concurrency import processutils
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_serialization import jsonutils
+from oslo_utils import fileutils
 
-from nova.openstack.common import fileutils
-from nova.openstack.common.gettextutils import _LE
-from nova.openstack.common.gettextutils import _LI
-from nova.openstack.common.gettextutils import _LW
-from nova.openstack.common import jsonutils
-from nova.openstack.common import log as logging
-from nova.openstack.common import processutils
+from nova.i18n import _LE
+from nova.i18n import _LI
+from nova.i18n import _LW
 from nova import utils
 from nova.virt import imagecache
-from nova.virt.libvirt import utils as virtutils
+from nova.virt.libvirt import utils as libvirt_utils
 
 LOG = logging.getLogger(__name__)
 
@@ -48,11 +48,13 @@ imagecache_opts = [
                help='Allows image information files to be stored in '
                     'non-standard locations'),
     cfg.BoolOpt('remove_unused_kernels',
-                default=False,
-                help='Should unused kernel images be removed? This is only '
-                     'safe to enable if all compute nodes have been updated '
-                     'to support this option. This will be enabled by default '
-                     'in future.'),
+                default=True,
+                deprecated_for_removal=True,
+                help='DEPRECATED: Should unused kernel images be removed? '
+                     'This is only safe to enable if all compute nodes have '
+                     'been updated to support this option (running Grizzly or '
+                     'newer level compute). This will be the default behavior '
+                     'in the 13.0.0 release.'),
     cfg.IntOpt('remove_unused_resized_minimum_age_seconds',
                default=3600,
                help='Unused resized base images younger than this will not be '
@@ -206,7 +208,7 @@ def write_stored_info(target, field=None, value=None):
         d['%s-timestamp' % field] = time.time()
 
         with open(info_file, 'w') as f:
-            f.write(json.dumps(d))
+            f.write(jsonutils.dumps(d))
 
     write_file(info_file, field, value)
 
@@ -246,6 +248,9 @@ class ImageCacheManager(imagecache.ImageCacheManager):
         self.image_popularity = {}
         self.instance_names = set()
 
+        self.back_swap_images = set()
+        self.used_swap_images = set()
+
         self.active_base_files = []
         self.corrupt_base_files = []
         self.originals = []
@@ -259,6 +264,14 @@ class ImageCacheManager(imagecache.ImageCacheManager):
             self.unexplained_images.append(entpath)
             if original:
                 self.originals.append(entpath)
+
+    def _store_swap_image(self, ent):
+        """Store base swap images for later examination."""
+        names = ent.split('_')
+        if len(names) == 2 and names[0] == 'swap':
+            if len(names[1]) > 0 and names[1].isdigit():
+                LOG.debug('Adding %s into backend swap images', ent)
+                self.back_swap_images.add(ent)
 
     def _list_base_images(self, base_dir):
         """Return a list of the images present in _base.
@@ -277,6 +290,8 @@ class ImageCacheManager(imagecache.ImageCacheManager):
                   ent[digest_size] == '_' and
                   not is_valid_info_file(os.path.join(base_dir, ent))):
                 self._store_image(base_dir, ent, original=False)
+            else:
+                self._store_swap_image(ent)
 
         return {'unexplained_images': self.unexplained_images,
                 'originals': self.originals}
@@ -291,7 +306,7 @@ class ImageCacheManager(imagecache.ImageCacheManager):
                 if os.path.exists(disk_path):
                     LOG.debug('%s has a disk file', ent)
                     try:
-                        backing_file = virtutils.get_disk_backing_file(
+                        backing_file = libvirt_utils.get_disk_backing_file(
                             disk_path)
                     except processutils.ProcessExecutionError:
                         # (for bug 1261442)
@@ -417,38 +432,71 @@ class ImageCacheManager(imagecache.ImageCacheManager):
 
         return inner_verify_checksum()
 
-    def _remove_base_file(self, base_file):
-        """Remove a single base file if it is old enough.
-
-        Returns nothing.
-        """
+    @staticmethod
+    def _get_age_of_file(base_file):
         if not os.path.exists(base_file):
-            LOG.debug('Cannot remove %s, it does not exist',
-                      base_file)
-            return
+            LOG.debug('Cannot remove %s, it does not exist', base_file)
+            return (False, 0)
 
         mtime = os.path.getmtime(base_file)
         age = time.time() - mtime
 
-        maxage = CONF.libvirt.remove_unused_resized_minimum_age_seconds
-        if base_file in self.originals:
-            maxage = CONF.remove_unused_original_minimum_age_seconds
+        return (True, age)
+
+    def _remove_old_enough_file(self, base_file, maxage, remove_sig=True,
+                                remove_lock=True):
+        """Remove a single swap or base file if it is old enough."""
+        exists, age = self._get_age_of_file(base_file)
+        if not exists:
+            return
 
         if age < maxage:
-            LOG.info(_LI('Base file too young to remove: %s'),
-                     base_file)
+            LOG.info(_LI('Base or swap file too young to remove: %s'),
+                         base_file)
         else:
-            LOG.info(_LI('Removing base file: %s'), base_file)
+            LOG.info(_LI('Removing base or swap file: %s'), base_file)
             try:
                 os.remove(base_file)
-                signature = get_info_filename(base_file)
-                if os.path.exists(signature):
-                    os.remove(signature)
+                if remove_sig:
+                    signature = get_info_filename(base_file)
+                    if os.path.exists(signature):
+                        os.remove(signature)
             except OSError as e:
                 LOG.error(_LE('Failed to remove %(base_file)s, '
                               'error was %(error)s'),
                           {'base_file': base_file,
                            'error': e})
+
+            if remove_lock:
+                try:
+                    # NOTE(jichenjc) The lock file will be constructed first
+                    # time the image file was accessed. the lock file looks
+                    # like nova-9e881789030568a317fad9daae82c5b1c65e0d4a
+                    # or nova-03d8e206-6500-4d91-b47d-ee74897f9b4e
+                    # according to the original file name
+                    lock_file = os.path.split(base_file)[-1]
+                    lockutils.remove_external_lock_file(lock_file,
+                        lock_file_prefix='nova-', lock_path=self.lock_path)
+                except OSError as e:
+                    LOG.debug('Failed to remove %(lock_file)s, '
+                              'error was %(error)s',
+                              {'lock_file': lock_file,
+                               'error': e})
+
+    def _remove_swap_file(self, base_file):
+        """Remove a single swap base file if it is old enough."""
+        maxage = CONF.remove_unused_original_minimum_age_seconds
+
+        self._remove_old_enough_file(base_file, maxage, remove_sig=False,
+                                     remove_lock=False)
+
+    def _remove_base_file(self, base_file):
+        """Remove a single base file if it is old enough."""
+        maxage = CONF.libvirt.remove_unused_resized_minimum_age_seconds
+        if base_file in self.originals:
+            maxage = CONF.remove_unused_original_minimum_age_seconds
+
+        self._remove_old_enough_file(base_file, maxage)
 
     def _handle_base_image(self, img_id, base_file):
         """Handle the checks for a single base image."""
@@ -474,7 +522,6 @@ class ImageCacheManager(imagecache.ImageCacheManager):
             # Give other threads a chance to run
             time.sleep(0)
 
-        instances = []
         if img_id in self.used_images:
             local, remote, instances = self.used_images[img_id]
 
@@ -516,8 +563,24 @@ class ImageCacheManager(imagecache.ImageCacheManager):
                           {'id': img_id,
                            'base_file': base_file})
                 if os.path.exists(base_file):
-                    virtutils.chown(base_file, os.getuid())
+                    libvirt_utils.chown(base_file, os.getuid())
                     os.utime(base_file, None)
+
+    def _age_and_verify_swap_images(self, context, base_dir):
+        LOG.debug('Verify swap images')
+
+        for ent in self.back_swap_images:
+            base_file = os.path.join(base_dir, ent)
+            if ent in self.used_swap_images and os.path.exists(base_file):
+                    libvirt_utils.chown(base_file, os.getuid())
+                    os.utime(base_file, None)
+            elif self.remove_unused_base_images:
+                self._remove_swap_file(base_file)
+
+        error_images = self.used_swap_images - self.back_swap_images
+        for error_image in error_images:
+            LOG.warn(_LW('%s swap image was used by instance'
+                         ' but no back files existing!'), error_image)
 
     def _age_and_verify_cached_images(self, context, all_instances, base_dir):
         LOG.debug('Verify base images')
@@ -597,5 +660,7 @@ class ImageCacheManager(imagecache.ImageCacheManager):
         self.used_images = running['used_images']
         self.image_popularity = running['image_popularity']
         self.instance_names = running['instance_names']
+        self.used_swap_images = running['used_swap_images']
         # perform the aging and image verification
         self._age_and_verify_cached_images(context, all_instances, base_dir)
+        self._age_and_verify_swap_images(context, base_dir)

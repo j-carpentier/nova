@@ -13,13 +13,12 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import logging
-
-from oslo.config import cfg
+from oslo_config import cfg
+from oslo_log import log as logging
 
 from nova import exception
+from nova.i18n import _, _LI
 import nova.image.download.base as xfer_base
-from nova.openstack.common.gettextutils import _
 import nova.virt.libvirt.utils as lv_utils
 
 
@@ -70,7 +69,7 @@ class FileTransfer(xfer_base.TransferBase):
 
     desc_required_keys = ['id', 'mountpoint']
 
-    #NOTE(jbresnah) because the group under which these options are added is
+    # NOTE(jbresnah) because the group under which these options are added is
     # dyncamically determined these options need to stay out of global space
     # or they will confuse generate_sample.sh
     filesystem_opts = [
@@ -89,8 +88,8 @@ class FileTransfer(xfer_base.TransferBase):
             group_name = 'image_file_url:' + fs
             conf_group = CONF[group_name]
             if conf_group.id is None:
-                msg = _('The group %s(group_name) must be configured with '
-                        'an id.')
+                msg = _('The group %(group_name)s must be configured with '
+                        'an id.') % {'group_name': group_name}
                 raise exception.ImageDownloadModuleConfigurationError(
                     module=str(self), reason=msg)
             fs_dict[CONF[group_name].id] = CONF[group_name]
@@ -143,7 +142,7 @@ class FileTransfer(xfer_base.TransferBase):
     def download(self, context, url_parts, dst_file, metadata, **kwargs):
         self.filesystems = self._get_options()
         if not self.filesystems:
-            #NOTE(jbresnah) when nothing is configured assume legacy behavior
+            # NOTE(jbresnah) when nothing is configured assume legacy behavior
             nova_mountpoint = '/'
             glance_mountpoint = '/'
         else:
@@ -161,7 +160,7 @@ class FileTransfer(xfer_base.TransferBase):
                                                   glance_mountpoint,
                                                   url_parts.path)
         lv_utils.copy_image(source_file, dst_file)
-        LOG.info(_('Copied %(source_file)s using %(module_str)s') %
+        LOG.info(_LI('Copied %(source_file)s using %(module_str)s'),
                  {'source_file': source_file, 'module_str': str(self)})
 
 

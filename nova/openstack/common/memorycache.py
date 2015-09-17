@@ -16,18 +16,23 @@
 
 """Super simple fake memcache client."""
 
-from oslo.config import cfg
+import copy
 
-from nova.openstack.common import timeutils
+from oslo_config import cfg
+from oslo_utils import timeutils
 
 memcache_opts = [
     cfg.ListOpt('memcached_servers',
-                default=None,
                 help='Memcached servers or None for in process cache.'),
 ]
 
 CONF = cfg.CONF
 CONF.register_opts(memcache_opts)
+
+
+def list_opts():
+    """Entry point for oslo-config-generator."""
+    return [(None, copy.deepcopy(memcache_opts))]
 
 
 def get_client(memcached_servers=None):
@@ -36,11 +41,8 @@ def get_client(memcached_servers=None):
     if not memcached_servers:
         memcached_servers = CONF.memcached_servers
     if memcached_servers:
-        try:
-            import memcache
-            client_cls = memcache.Client
-        except ImportError:
-            pass
+        import memcache
+        client_cls = memcache.Client
 
     return client_cls(memcached_servers, debug=0)
 

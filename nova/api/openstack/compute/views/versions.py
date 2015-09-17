@@ -28,11 +28,12 @@ class ViewBuilder(common.ViewBuilder):
 
     def __init__(self, base_url):
         """:param base_url: url of the root wsgi application."""
+        self.prefix = self._update_compute_link_prefix(base_url)
         self.base_url = base_url
 
     def build_choices(self, VERSIONS, req):
         version_objs = []
-        for version in VERSIONS:
+        for version in sorted(VERSIONS):
             version = VERSIONS[version]
             version_objs.append({
                 "id": version['id'],
@@ -55,6 +56,8 @@ class ViewBuilder(common.ViewBuilder):
             version_objs.append({
                 "id": version['id'],
                 "status": version['status'],
+                "version": version['version'],
+                "min_version": version['min_version'],
                 "updated": version['updated'],
                 "links": self._build_links(version),
             })
@@ -65,7 +68,7 @@ class ViewBuilder(common.ViewBuilder):
         reval = copy.deepcopy(version)
         reval['links'].insert(0, {
             "rel": "self",
-            "href": self.base_url.rstrip('/') + '/',
+            "href": self.prefix.rstrip('/') + '/',
         })
         return dict(version=reval)
 
@@ -84,14 +87,13 @@ class ViewBuilder(common.ViewBuilder):
 
     def generate_href(self, version, path=None):
         """Create an url that refers to a specific version_number."""
-        prefix = self._update_compute_link_prefix(self.base_url)
-        if version.find('v3.') == 0:
-            version_number = 'v3'
+        if version.find('v2.1') == 0:
+            version_number = 'v2.1'
         else:
             version_number = 'v2'
 
         if path:
             path = path.strip('/')
-            return os.path.join(prefix, version_number, path)
+            return os.path.join(self.prefix, version_number, path)
         else:
-            return os.path.join(prefix, version_number) + '/'
+            return os.path.join(self.prefix, version_number) + '/'

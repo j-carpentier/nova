@@ -16,8 +16,8 @@
 Client side of the console RPC API.
 """
 
-from oslo.config import cfg
-from oslo import messaging
+from oslo_config import cfg
+import oslo_messaging as messaging
 
 from nova import rpc
 
@@ -49,15 +49,17 @@ class ConsoleAPI(object):
 
         2.0 - Major API rev for Icehouse
 
-        ... Icehouse supports message version 2.0.  So, any changes to
-        existing methods in 2.x after that point should be done such that they
-        can handle the version_cap being set to 2.0.
+        ... Icehouse, Juno and Kilo support message version 2.0.  So, any
+        changes to existing methods in 2.x after that point should be done such
+        that they can handle the version_cap being set to 2.0.
     '''
 
     VERSION_ALIASES = {
         'grizzly': '1.1',
         'havana': '1.1',
         'icehouse': '2.0',
+        'juno': '2.0',
+        'kilo': '2.0',
     }
 
     def __init__(self, topic=None, server=None):
@@ -68,19 +70,10 @@ class ConsoleAPI(object):
                                                CONF.upgrade_levels.console)
         self.client = rpc.get_client(target, version_cap=version_cap)
 
-    def _get_compat_version(self, current, havana_compat):
-        if not self.client.can_send_version(current):
-            return havana_compat
-        return current
-
     def add_console(self, ctxt, instance_id):
-        # NOTE(russellb) Havana compat
-        version = self._get_compat_version('2.0', '1.0')
-        cctxt = self.client.prepare(version=version)
+        cctxt = self.client.prepare()
         cctxt.cast(ctxt, 'add_console', instance_id=instance_id)
 
     def remove_console(self, ctxt, console_id):
-        # NOTE(russellb) Havana compat
-        version = self._get_compat_version('2.0', '1.0')
-        cctxt = self.client.prepare(version=version)
+        cctxt = self.client.prepare()
         cctxt.cast(ctxt, 'remove_console', console_id=console_id)

@@ -14,9 +14,11 @@
 #    under the License.
 
 
-from nova.openstack.common.gettextutils import _
-from nova.openstack.common import importutils
-from nova.openstack.common import log as logging
+from oslo_log import log as logging
+from oslo_utils import importutils
+from oslo_utils import strutils
+
+from nova.i18n import _LE, _LW
 from nova.volume.encryptors import nop
 
 
@@ -35,13 +37,24 @@ def get_volume_encryptor(connection_info, **kwargs):
     if location and location.lower() == 'front-end':  # case insensitive
         provider = kwargs.get('provider')
 
+        if provider == 'LuksEncryptor':
+            provider = 'nova.volume.encryptors.luks.' + provider
+        elif provider == 'CryptsetupEncryptor':
+            provider = 'nova.volume.encryptors.cryptsetup.' + provider
+        elif provider == 'NoOpEncryptor':
+            provider = 'nova.volume.encryptors.nop.' + provider
         try:
             encryptor = importutils.import_object(provider, connection_info,
                                                   **kwargs)
         except Exception as e:
-            LOG.error(_("Error instantiating %(provider)s: %(exception)s"),
-                      provider=provider, exception=e)
+            LOG.error(_LE("Error instantiating %(provider)s: %(exception)s"),
+                      {'provider': provider, 'exception': e})
             raise
+
+    msg = ("Using volume encryptor '%(encryptor)s' for connection: "
+           "%(connection_info)s" %
+           {'encryptor': encryptor, 'connection_info': connection_info})
+    LOG.debug(strutils.mask_password(msg))
 
     return encryptor
 
@@ -53,10 +66,19 @@ def get_encryption_metadata(context, volume_api, volume_id, connection_info):
         try:
             metadata = volume_api.get_volume_encryption_metadata(context,
                                                                  volume_id)
+            if not metadata:
+                LOG.warn(_LW('Volume %s should be encrypted but there is no '
+                             'encryption metadata.'), volume_id)
         except Exception as e:
-            LOG.error(_("Failed to retrieve encryption metadata for "
-                            "volume %(volume_id)s: %(exception)s"),
-                          {'volume_id': volume_id, 'exception': e})
+            LOG.error(_LE("Failed to retrieve encryption metadata for "
+                          "volume %(volume_id)s: %(exception)s"),
+                      {'volume_id': volume_id, 'exception': e})
             raise
+
+    if metadata:
+        msg = ("Using volume encryption metadata '%(metadata)s' for "
+               "connection: %(connection_info)s" %
+               {'metadata': metadata, 'connection_info': connection_info})
+        LOG.debug(strutils.mask_password(msg))
 
     return metadata

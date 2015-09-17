@@ -44,11 +44,30 @@ Nova Db
 
 ``nova-manage db version``
 
-    Print the current database version.
+    Print the current main database version.
 
 ``nova-manage db sync``
 
-    Sync the database up to the most recent version. This is the standard way to create the db as well.
+    Sync the main database up to the most recent version. This is the standard way to create the db as well.
+
+``nova-manage db archive_deleted_rows [--max_rows <number>]``
+
+    Move deleted rows from production tables to shadow tables.
+
+``nova-manage db null_instance_uuid_scan [--delete]``
+
+    Lists and optionally deletes database records where instance_uuid is NULL.
+
+Nova ApiDb
+~~~~~~~~~~
+
+``nova-manage api_db version``
+
+    Print the current cells api database version.
+
+``nova-manage api_db sync``
+
+    Sync the api cells database up to the most recent version. This is the standard way to create the db as well.
 
 Nova Logs
 ~~~~~~~~~
@@ -114,44 +133,6 @@ Nova Floating IPs
 ``nova-manage floating list``
 
     Displays a list of all floating IP addresses.
-
-Nova Flavor
-~~~~~~~~~~~
-
-**DEPRECATED** Use the nova flavor-* commands from python-novaclient instead.
-The flavor subcommand will be removed in the 2015.1 release.
-
-``nova-manage flavor list``
-
-    Outputs a list of all active flavors to the screen.
-
-``nova-manage flavor list --all``
-
-    Outputs a list of all flavors (active and inactive) to the screen.
-
-``nova-manage flavor create <name> <memory> <vCPU> <local_storage> <flavorID> <(optional) swap> <(optional) RXTX Quota> <(optional) RXTX Cap>``
-
-    creates a flavor with the following positional arguments:
-     * memory (expressed in megabytes)
-     * vcpu(s) (integer)
-     * local storage (expressed in gigabytes)
-     * flavorid (unique integer)
-     * swap space (expressed in megabytes, defaults to zero, optional)
-     * RXTX quotas (expressed in gigabytes, defaults to zero, optional)
-     * RXTX cap (expressed in gigabytes, defaults to zero, optional)
-
-``nova-manage flavor delete <name>``
-
-    Delete the flavor with the name <name>. This marks the flavor as inactive and cannot be launched. However, the record stays in the database for archival and billing purposes.
-
-``nova-manage flavor delete <name> --purge``
-
-    Purges the flavor with the name <name>. This removes this flavor from the database.
-
-Nova Instance_type
-~~~~~~~~~~~~~~~~~~
-
-The instance_type command is provided as an alias for the flavor command. All the same subcommands and arguments from nova-manage flavor can be used.
 
 Nova Images
 ~~~~~~~~~~~

@@ -16,15 +16,16 @@
 
 import hashlib
 
+from oslo_log import log as logging
+from oslo_utils import timeutils
+
+from nova.api.openstack import api_version_request
 from nova.api.openstack import common
 from nova.api.openstack.compute.views import addresses as views_addresses
 from nova.api.openstack.compute.views import flavors as views_flavors
 from nova.api.openstack.compute.views import images as views_images
-from nova.compute import flavors
+from nova.i18n import _LW
 from nova.objects import base as obj_base
-from nova.openstack.common.gettextutils import _
-from nova.openstack.common import log as logging
-from nova.openstack.common import timeutils
 from nova import utils
 
 
@@ -42,11 +43,17 @@ class ViewBuilder(common.ViewBuilder):
         "REBUILD",
         "RESIZE",
         "VERIFY_RESIZE",
+        "MIGRATING",
     )
 
     _fault_statuses = (
         "ERROR", "DELETED"
     )
+
+    # These are the lazy-loadable instance attributes required for showing
+    # details about an instance. Add to this list as new things need to be
+    # shown.
+    _show_expected_attrs = ['flavor', 'info_cache', 'metadata']
 
     def __init__(self):
         """Initialize view builder."""
@@ -77,6 +84,26 @@ class ViewBuilder(common.ViewBuilder):
                                          self._collection_name),
             },
         }
+
+    def get_show_expected_attrs(self, expected_attrs=None):
+        """Returns a list of lazy-loadable expected attributes used by show
+
+        This should be used when getting the instances from the database so
+        that the necessary attributes are pre-loaded before needing to build
+        the show response where lazy-loading can fail if an instance was
+        deleted.
+
+        :param list expected_attrs: The list of expected attributes that will
+            be requested in addition to what this view builder requires. This
+            method will merge the two lists and return what should be
+            ultimately used when getting an instance from the database.
+        :returns: merged and sorted list of expected attributes
+        """
+        if expected_attrs is None:
+            expected_attrs = []
+        # NOTE(mriedem): We sort the list so we can have predictable test
+        # results.
+        return sorted(list(set(self._show_expected_attrs + expected_attrs)))
 
     def show(self, request, instance):
         """Detailed view of a single instance."""
@@ -166,13 +193,14 @@ class ViewBuilder(common.ViewBuilder):
         host = instance.get("host")
         project = str(instance.get("project_id"))
         if host:
-            sha_hash = hashlib.sha224(project + host)  # pylint: disable=E1101
+            sha_hash = hashlib.sha224(project + host)
             return sha_hash.hexdigest()
 
-    def _get_addresses(self, request, instance):
+    def _get_addresses(self, request, instance, extend_address=False):
         context = request.environ["nova.context"]
         networks = common.get_networks_for_instance(context, instance)
-        return self._address_builder.index(networks)["addresses"]
+        return self._address_builder.index(networks,
+                                           extend_address)["addresses"]
 
     def _get_image(self, request, instance):
         image_ref = instance["image_ref"]
@@ -192,10 +220,10 @@ class ViewBuilder(common.ViewBuilder):
             return ""
 
     def _get_flavor(self, request, instance):
-        instance_type = flavors.extract_flavor(instance)
+        instance_type = instance.get_flavor()
         if not instance_type:
-            LOG.warn(_("Instance has had its instance_type removed "
-                    "from the DB"), instance=instance)
+            LOG.warning(_LW("Instance has had its instance_type removed "
+                            "from the DB"), instance=instance)
             return {}
         flavor_id = instance_type["flavorid"]
         flavor_bookmark = self._flavor_builder._get_bookmark_link(request,
@@ -234,16 +262,18 @@ class ViewBuilder(common.ViewBuilder):
         return fault_dict
 
 
-class ViewBuilderV3(ViewBuilder):
-    """Model a server V3 API response as a python dictionary."""
+class ViewBuilderV21(ViewBuilder):
+    """Model a server v2.1 API response as a python dictionary."""
 
     def __init__(self):
         """Initialize view builder."""
-        super(ViewBuilderV3, self).__init__()
-        self._address_builder = views_addresses.ViewBuilderV3()
-        self._image_builder = views_images.ViewBuilderV3()
+        super(ViewBuilderV21, self).__init__()
+        self._address_builder = views_addresses.ViewBuilderV21()
+        # TODO(alex_xu): In V3 API, we correct the image bookmark link to
+        # use glance endpoint. We revert back it to use nova endpoint for v2.1.
+        self._image_builder = views_images.ViewBuilder()
 
-    def show(self, request, instance):
+    def show(self, request, instance, extend_address=True):
         """Detailed view of a single instance."""
         server = {
             "server": {
@@ -253,12 +283,16 @@ class ViewBuilderV3(ViewBuilder):
                 "tenant_id": instance.get("project_id") or "",
                 "user_id": instance.get("user_id") or "",
                 "metadata": self._get_metadata(instance),
-                "host_id": self._get_host_id(instance) or "",
+                "hostId": self._get_host_id(instance) or "",
+                # TODO(alex_xu): '_get_image' return {} when there image_ref
+                # isn't existed in V3 API, we revert it back to return "" in
+                # V2.1.
                 "image": self._get_image(request, instance),
                 "flavor": self._get_flavor(request, instance),
                 "created": timeutils.isotime(instance["created_at"]),
                 "updated": timeutils.isotime(instance["updated_at"]),
-                "addresses": self._get_addresses(request, instance),
+                "addresses": self._get_addresses(request, instance,
+                                                 extend_address),
                 "links": self._get_links(request,
                                          instance["uuid"],
                                          self._collection_name),
@@ -272,7 +306,9 @@ class ViewBuilderV3(ViewBuilder):
         if server["server"]["status"] in self._progress_statuses:
             server["server"]["progress"] = instance.get("progress", 0)
 
-        # We should modify the "image" to empty dictionary
-        if not server["server"]["image"]:
-            server["server"]["image"] = {}
+        if (request.api_version_request >=
+                api_version_request.APIVersionRequest("2.9")):
+            server["server"]["locked"] = (True if instance["locked_by"]
+                                          else False)
+
         return server

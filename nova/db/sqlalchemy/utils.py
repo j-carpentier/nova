@@ -13,8 +13,10 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from oslo_db import exception as db_exc
+from oslo_db.sqlalchemy import utils as oslodbutils
+from oslo_log import log as logging
 from sqlalchemy.exc import OperationalError
-from sqlalchemy.exc import ProgrammingError
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy import MetaData
 from sqlalchemy.sql.expression import UpdateBase
@@ -23,9 +25,7 @@ from sqlalchemy.types import NullType
 
 from nova.db.sqlalchemy import api as db
 from nova import exception
-from nova.openstack.common.db.sqlalchemy import utils as oslodbutils
-from nova.openstack.common.gettextutils import _
-from nova.openstack.common import log as logging
+from nova.i18n import _, _LE
 
 
 LOG = logging.getLogger(__name__)
@@ -60,10 +60,10 @@ def check_shadow_table(migrate_engine, table_name):
     shadow_table = Table(db._SHADOW_TABLE_PREFIX + table_name, meta,
                          autoload=True)
 
-    columns = dict([(c.name, c) for c in table.columns])
-    shadow_columns = dict([(c.name, c) for c in shadow_table.columns])
+    columns = {c.name: c for c in table.columns}
+    shadow_columns = {c.name: c for c in shadow_table.columns}
 
-    for name, column in columns.iteritems():
+    for name, column in columns.items():
         if name not in shadow_columns:
             raise exception.NovaException(
                 _("Missing column %(table)s.%(column)s in shadow table")
@@ -78,7 +78,7 @@ def check_shadow_table(migrate_engine, table_name):
                            'c_type': column.type,
                            'shadow_c_type': shadow_column.type})
 
-    for name, column in shadow_columns.iteritems():
+    for name, column in shadow_columns.items():
         if name not in columns:
             raise exception.NovaException(
                 _("Extra column %(table)s.%(column)s in shadow table")
@@ -93,10 +93,8 @@ def create_shadow_table(migrate_engine, table_name=None, table=None,
     :param table_name: Autoload table with this name and create shadow table
     :param table: Autoloaded table, so just create corresponding shadow table.
     :param col_name_col_instance:   contains pair column_name=column_instance.
-                            column_instance is instance of Column. These params
-                            are required only for columns that have unsupported
-                            types by sqlite. For example BigInteger.
-
+    column_instance is instance of Column. These params are required only for
+    columns that have unsupported types by sqlite. For example BigInteger.
     :returns: The created shadow_table object.
     """
     meta = MetaData(bind=migrate_engine)
@@ -126,10 +124,13 @@ def create_shadow_table(migrate_engine, table_name=None, table=None,
     try:
         shadow_table.create()
         return shadow_table
-    except (OperationalError, ProgrammingError):
+    except (db_exc.DBError, OperationalError):
+        # NOTE(ekudryashova): At the moment there is a case in oslo.db code,
+        # which raises unwrapped OperationalError, so we should catch it until
+        # oslo.db would wraps all such exceptions
         LOG.info(repr(shadow_table))
-        LOG.exception(_('Exception while creating table.'))
+        LOG.exception(_LE('Exception while creating table.'))
         raise exception.ShadowTableExists(name=shadow_table_name)
     except Exception:
         LOG.info(repr(shadow_table))
-        LOG.exception(_('Exception while creating table.'))
+        LOG.exception(_LE('Exception while creating table.'))

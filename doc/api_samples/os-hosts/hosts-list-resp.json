@@ -1,38 +1,38 @@
 {
     "hosts": [
         {
-            "host_name": "787f4f6dda1b409bb8b2f9082349690e",
-            "service": "compute",
-            "zone": "nova"
-        },
-        {
-            "host_name": "a98b433151084aee8b1a986e28823b36",
-            "service": "cert",
-            "zone": "internal"
-        },
-        {
-            "host_name": "c56158d13a884a87abf9171efb7de9d8",
-            "service": "network",
-            "zone": "internal"
-        },
-        {
-            "host_name": "81d5cdcda0014918b3ebd3503a2e5c9a",
-            "service": "scheduler",
-            "zone": "internal"
-        },
-        {
-            "host_name": "6e48bfe1a3304b7b86154326328750ae",
+            "host_name": "b6e4adbc193d428ea923899d07fb001e",
             "service": "conductor",
             "zone": "internal"
         },
         {
-            "host_name": "39f55087a1024d1380755951c945ca69",
-            "service": "cells",
+            "host_name": "09c025b0efc64211bd23fc50fa974cdf",
+            "service": "compute",
+            "zone": "nova"
+        },
+        {
+            "host_name": "a942ebfa00064d9d89a9e5a175cb9ba8",
+            "service": "cert",
             "zone": "internal"
         },
         {
-            "host_name": "7a9a6cb4701f4dee9048fe0bc25d0ee5",
+            "host_name": "e73ec0bd35c64de4a1adfa8b8969a1f6",
             "service": "consoleauth",
+            "zone": "internal"
+        },
+        {
+            "host_name": "396a8a0a234f476eb05fb9fbc5802ba7",
+            "service": "network",
+            "zone": "internal"
+        },
+        {
+            "host_name": "abffda96592c4eacaf4111c28fddee17",
+            "service": "scheduler",
+            "zone": "internal"
+        },
+        {
+            "host_name": "a8820f04962a4b4ba9fe2e9540c24094",
+            "service": "cells",
             "zone": "internal"
         }
     ]

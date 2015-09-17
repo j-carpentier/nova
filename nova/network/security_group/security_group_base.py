@@ -19,16 +19,19 @@
 
 import urllib
 
-from oslo.config import cfg
+from oslo_config import cfg
 
 from nova import exception
-from nova.openstack.common.gettextutils import _
+from nova.i18n import _
 from nova import utils
 
 CONF = cfg.CONF
 
 
 class SecurityGroupBase(object):
+
+    def __init__(self, skip_policy_check=False):
+        self.skip_policy_check = skip_policy_check
 
     def parse_cidr(self, cidr):
         if cidr:
@@ -86,11 +89,11 @@ class SecurityGroupBase(object):
                 to_port = int(to_port)
             except ValueError:
                 if ip_protocol.upper() == 'ICMP':
-                    raise exception.InvalidInput(reason="Type and"
-                         " Code must be integers for ICMP protocol type")
+                    raise exception.InvalidInput(reason=_("Type and"
+                         " Code must be integers for ICMP protocol type"))
                 else:
-                    raise exception.InvalidInput(reason="To and From ports "
-                          "must be integers")
+                    raise exception.InvalidInput(reason=_("To and From ports "
+                          "must be integers"))
 
             if ip_protocol.upper() not in ['TCP', 'UDP', 'ICMP']:
                 raise exception.InvalidIpProtocol(protocol=ip_protocol)
@@ -209,31 +212,43 @@ class SecurityGroupBase(object):
         raise NotImplementedError()
 
     def add_to_instance(self, context, instance, security_group_name):
+        """Add security group to the instance.
+
+        :param context: The request context.
+        :param instance: nova.objects.instance.Instance object.
+        :param security_group_name: security group name to add
+        """
         raise NotImplementedError()
 
     def remove_from_instance(self, context, instance, security_group_name):
+        """Remove the security group associated with the instance.
+
+        :param context: The request context.
+        :param instance: nova.objects.instance.Instance object.
+        :param security_group_name: security group name to remove
+        """
         raise NotImplementedError()
 
     @staticmethod
     def raise_invalid_property(msg):
-        raise NotImplementedError()
+        raise exception.Invalid(msg)
 
     @staticmethod
     def raise_group_already_exists(msg):
-        raise NotImplementedError()
+        raise exception.Invalid(msg)
 
     @staticmethod
     def raise_invalid_group(msg):
-        raise NotImplementedError()
+        raise exception.Invalid(msg)
 
     @staticmethod
     def raise_invalid_cidr(cidr, decoding_exception=None):
-        raise NotImplementedError()
+        raise exception.InvalidCidr(cidr=cidr)
 
     @staticmethod
     def raise_over_quota(msg):
-        raise NotImplementedError()
+        raise exception.SecurityGroupLimitExceeded(msg)
 
     @staticmethod
     def raise_not_found(msg):
-        raise NotImplementedError()
+        raise exception.SecurityGroupNotFound(msg)

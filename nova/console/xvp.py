@@ -19,14 +19,14 @@ import os
 import signal
 
 import jinja2
-from oslo.config import cfg
+from oslo_concurrency import processutils
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_utils import excutils
 
 from nova import context
 from nova import db
-from nova.openstack.common import excutils
-from nova.openstack.common.gettextutils import _
-from nova.openstack.common import log as logging
-from nova.openstack.common import processutils
+from nova.i18n import _, _LE
 from nova import paths
 from nova import utils
 
@@ -46,6 +46,8 @@ xvp_opts = [
                help='XVP log file'),
     cfg.IntOpt('console_xvp_multiplex_port',
                default=5900,
+               min=1,
+               max=65535,
                help='Port for XVP to multiplex VNC connections on'),
     ]
 
@@ -69,7 +71,7 @@ class XVPConsoleProxy(object):
 
     def get_port(self, context):
         """Get available port for consoles that need one."""
-        #TODO(mdragon): implement port selection for non multiplex ports,
+        # TODO(mdragon): implement port selection for non multiplex ports,
         #               we are not using that, but someone else may want
         #               it.
         return CONF.console_xvp_multiplex_port
@@ -121,7 +123,7 @@ class XVPConsoleProxy(object):
                 cfile.write(config)
         except IOError:
             with excutils.save_and_reraise_exception():
-                LOG.exception(_("Failed to write configuration file"))
+                LOG.exception(_LE("Failed to write configuration file"))
 
     def _xvp_stop(self):
         LOG.debug('Stopping xvp')
@@ -131,7 +133,7 @@ class XVPConsoleProxy(object):
         try:
             os.kill(pid, signal.SIGTERM)
         except OSError:
-            #if it's already not running, no problem.
+            # if it's already not running, no problem.
             pass
 
     def _xvp_start(self):
@@ -144,7 +146,7 @@ class XVPConsoleProxy(object):
                           '-c', CONF.console_xvp_conf,
                           '-l', CONF.console_xvp_log)
         except processutils.ProcessExecutionError as err:
-            LOG.error(_('Error starting xvp: %s') % err)
+            LOG.error(_LE('Error starting xvp: %s'), err)
 
     def _xvp_restart(self):
         LOG.debug('Restarting xvp')
@@ -196,7 +198,7 @@ class XVPConsoleProxy(object):
         if is_pool_password:
             maxlen = 16
             flag = '-x'
-        #xvp will blow up on passwords that are too long (mdragon)
+        # xvp will blow up on passwords that are too long (mdragon)
         password = password[:maxlen]
         out, err = utils.execute('xvp', flag, process_input=password)
         if err:

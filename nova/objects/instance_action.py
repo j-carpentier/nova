@@ -12,17 +12,18 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import traceback
-
-import six
+from oslo_utils import timeutils
 
 from nova import db
+from nova import objects
 from nova.objects import base
 from nova.objects import fields
-from nova.openstack.common import timeutils
 
 
-class InstanceAction(base.NovaPersistentObject, base.NovaObject):
+# TODO(berrange): Remove NovaObjectDictCompat
+@base.NovaObjectRegistry.register
+class InstanceAction(base.NovaPersistentObject, base.NovaObject,
+                     base.NovaObjectDictCompat):
     # Version 1.0: Initial version
     # Version 1.1: String attributes updated to support unicode
     VERSION = '1.1'
@@ -87,12 +88,13 @@ class InstanceAction(base.NovaPersistentObject, base.NovaObject):
             return cls._from_db_object(context, cls(), db_action)
 
     @base.remotable
-    def finish(self, context):
-        values = self.pack_action_finish(context, self.instance_uuid)
-        db_action = db.action_finish(context, values)
-        self._from_db_object(context, self, db_action)
+    def finish(self):
+        values = self.pack_action_finish(self._context, self.instance_uuid)
+        db_action = db.action_finish(self._context, values)
+        self._from_db_object(self._context, self, db_action)
 
 
+@base.NovaObjectRegistry.register
 class InstanceActionList(base.ObjectListBase, base.NovaObject):
     # Version 1.0: Initial version
     #              InstanceAction <= version 1.1
@@ -100,9 +102,9 @@ class InstanceActionList(base.ObjectListBase, base.NovaObject):
     fields = {
         'objects': fields.ListOfObjectsField('InstanceAction'),
         }
-    child_versions = {
-        '1.0': '1.1',
-        # NOTE(danms): InstanceAction was at 1.1 before we added this
+    # NOTE(danms): InstanceAction was at 1.1 before we added this
+    obj_relationships = {
+        'objects': [('1.0', '1.1')]
         }
 
     @base.remotable_classmethod
@@ -111,20 +113,10 @@ class InstanceActionList(base.ObjectListBase, base.NovaObject):
         return base.obj_make_list(context, cls(), InstanceAction, db_actions)
 
 
-def serialize_args(fn):
-    def wrapper(cls, *args, **kwargs):
-        exc_val = kwargs.get('exc_val')
-        exc_tb = kwargs.get('exc_tb')
-        if exc_val is not None:
-            kwargs['exc_val'] = str(exc_val)
-        if not isinstance(exc_tb, six.string_types) and exc_tb is not None:
-            kwargs['exc_tb'] = ''.join(traceback.format_tb(exc_tb))
-        # NOTE(danms): We wrap a descriptor, so use that protocol
-        return fn.__get__(None, cls)(*args, **kwargs)
-    return classmethod(wrapper)
-
-
-class InstanceActionEvent(base.NovaPersistentObject, base.NovaObject):
+# TODO(berrange): Remove NovaObjectDictCompat
+@base.NovaObjectRegistry.register
+class InstanceActionEvent(base.NovaPersistentObject, base.NovaObject,
+                          base.NovaObjectDictCompat):
     # Version 1.0: Initial version
     # Version 1.1: event_finish_with_failure decorated with serialize_args
     VERSION = '1.1'
@@ -182,7 +174,7 @@ class InstanceActionEvent(base.NovaPersistentObject, base.NovaObject):
         if want_result:
             return cls._from_db_object(context, cls(), db_event)
 
-    @serialize_args
+    @base.serialize_args
     @base.remotable_classmethod
     def event_finish_with_failure(cls, context, instance_uuid, event_name,
                                   exc_val=None, exc_tb=None, want_result=None):
@@ -202,29 +194,31 @@ class InstanceActionEvent(base.NovaPersistentObject, base.NovaObject):
                                              want_result=want_result)
 
     @base.remotable
-    def finish_with_failure(self, context, exc_val, exc_tb):
-        values = self.pack_action_event_finish(context, self.instance_uuid,
+    def finish_with_failure(self, exc_val, exc_tb):
+        values = self.pack_action_event_finish(self._context,
+                                               self.instance_uuid,
                                                self.event, exc_val=exc_val,
                                                exc_tb=exc_tb)
-        db_event = db.action_event_finish(context, values)
-        self._from_db_object(context, self, db_event)
+        db_event = db.action_event_finish(self._context, values)
+        self._from_db_object(self._context, self, db_event)
 
     @base.remotable
-    def finish(self, context):
-        self.finish_with_failure(context, exc_val=None, exc_tb=None)
+    def finish(self):
+        self.finish_with_failure(self._context, exc_val=None, exc_tb=None)
 
 
+@base.NovaObjectRegistry.register
 class InstanceActionEventList(base.ObjectListBase, base.NovaObject):
+    VERSION = '1.1'
     fields = {
         'objects': fields.ListOfObjectsField('InstanceActionEvent'),
         }
-    child_versions = {
-        '1.0': '1.0',
-        '1.0': '1.1',
+    obj_relationships = {
+        'objects': [('1.0', '1.0'), ('1.1', '1.1')],
         }
 
     @base.remotable_classmethod
     def get_by_action(cls, context, action_id):
         db_events = db.action_events_get(context, action_id)
-        return base.obj_make_list(context, cls(), InstanceActionEvent,
-                                  db_events)
+        return base.obj_make_list(context, cls(context),
+                                  objects.InstanceActionEvent, db_events)

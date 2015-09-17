@@ -19,21 +19,25 @@ Cells Service Manager
 import datetime
 import time
 
-from oslo.config import cfg
-from oslo import messaging as oslo_messaging
+from oslo_config import cfg
+from oslo_log import log as logging
+import oslo_messaging
+from oslo_service import periodic_task
+from oslo_utils import importutils
+from oslo_utils import timeutils
+import six
+from six.moves import range
 
 from nova.cells import messaging
 from nova.cells import state as cells_state
 from nova.cells import utils as cells_utils
 from nova import context
 from nova import exception
+from nova.i18n import _LW
 from nova import manager
+from nova import objects
+from nova.objects import base as base_obj
 from nova.objects import instance as instance_obj
-from nova.openstack.common.gettextutils import _
-from nova.openstack.common import importutils
-from nova.openstack.common import log as logging
-from nova.openstack.common import periodic_task
-from nova.openstack.common import timeutils
 
 cell_manager_opts = [
         cfg.StrOpt('driver',
@@ -72,15 +76,18 @@ class CellsManager(manager.Manager):
     Scheduling requests get passed to the scheduler class.
     """
 
-    target = oslo_messaging.Target(version='1.27')
+    target = oslo_messaging.Target(version='1.37')
 
     def __init__(self, *args, **kwargs):
-        LOG.warn(_('The cells feature of Nova is considered experimental '
-                   'by the OpenStack project because it receives much '
-                   'less testing than the rest of Nova. This may change '
-                   'in the future, but current deployers should be aware '
-                   'that the use of it in production right now may be '
-                   'risky.'))
+        LOG.warning(_LW('The cells feature of Nova is considered experimental '
+                        'by the OpenStack project because it receives much '
+                        'less testing than the rest of Nova. This may change '
+                        'in the future, but current deployers should be aware '
+                        'that the use of it in production right now may be '
+                        'risky. Also note that cells does not currently '
+                        'support rolling upgrades, it is assumed that cells '
+                        'deployments are upgraded lockstep so n-1 cells '
+                        'compatibility does not work.'))
         # Mostly for tests.
         cell_state_manager = kwargs.pop('cell_state_manager', None)
         super(CellsManager, self).__init__(service_name='cells',
@@ -146,7 +153,7 @@ class CellsManager(manager.Manager):
 
         def _next_instance():
             try:
-                instance = self.instances_to_heal.next()
+                instance = next(self.instances_to_heal)
             except StopIteration:
                 if info['updated_list']:
                     return
@@ -160,14 +167,14 @@ class CellsManager(manager.Manager):
                         uuids_only=True)
                 info['updated_list'] = True
                 try:
-                    instance = self.instances_to_heal.next()
+                    instance = next(self.instances_to_heal)
                 except StopIteration:
                     return
             return instance
 
         rd_context = ctxt.elevated(read_deleted='yes')
 
-        for i in xrange(CONF.cells.instance_update_num_instances):
+        for i in range(CONF.cells.instance_update_num_instances):
             while True:
                 # Yield to other greenthreads
                 time.sleep(0)
@@ -175,7 +182,7 @@ class CellsManager(manager.Manager):
                 if not instance_uuid:
                     return
                 try:
-                    instance = self.db.instance_get_by_uuid(rd_context,
+                    instance = objects.Instance.get_by_uuid(rd_context,
                             instance_uuid)
                 except exception.InstanceNotFound:
                     continue
@@ -186,7 +193,7 @@ class CellsManager(manager.Manager):
         """Broadcast an instance_update or instance_destroy message up to
         parent cells.
         """
-        if instance['deleted']:
+        if instance.deleted:
             self.instance_destroy_at_top(ctxt, instance)
         else:
             self.instance_update_at_top(ctxt, instance)
@@ -196,6 +203,22 @@ class CellsManager(manager.Manager):
         forward the request accordingly.
         """
         # Target is ourselves first.
+        filter_properties = build_inst_kwargs.get('filter_properties')
+        if (filter_properties is not None and
+            not isinstance(filter_properties['instance_type'],
+                           objects.Flavor)):
+            # NOTE(danms): Handle pre-1.30 build_instances() call. Remove me
+            # when we bump the RPC API version to 2.0.
+            flavor = objects.Flavor(**filter_properties['instance_type'])
+            build_inst_kwargs['filter_properties'] = dict(
+                filter_properties, instance_type=flavor)
+        instances = build_inst_kwargs['instances']
+        if not isinstance(instances[0], objects.Instance):
+            # NOTE(danms): Handle pre-1.32 build_instances() call. Remove me
+            # when we bump the RPC API version to 2.0
+            build_inst_kwargs['instances'] = instance_obj._make_instance_list(
+                ctxt, objects.InstanceList(), instances, ['system_metadata',
+                                                          'metadata'])
         our_cell = self.state_manager.get_my_state()
         self.msg_runner.build_instances(ctxt, our_cell, build_inst_kwargs)
 
@@ -226,8 +249,8 @@ class CellsManager(manager.Manager):
         deleted or soft_deleted.  So, we'll broadcast this everywhere.
         """
         if isinstance(instance, dict):
-            instance = instance_obj.Instance._from_db_object(ctxt,
-                    instance_obj.Instance(), instance)
+            instance = objects.Instance._from_db_object(ctxt,
+                    objects.Instance(), instance)
         self.msg_runner.instance_delete_everywhere(ctxt, instance,
                                                    delete_type)
 
@@ -254,10 +277,12 @@ class CellsManager(manager.Manager):
         for response in responses:
             services = response.value_or_raise()
             for service in services:
-                cells_utils.add_cell_to_service(service, response.cell_name)
+                service = cells_utils.add_cell_to_service(
+                    service, response.cell_name)
                 ret_services.append(service)
         return ret_services
 
+    @oslo_messaging.expected_exceptions(exception.CellRoutingInconsistency)
     def service_get_by_compute_host(self, ctxt, host_name):
         """Return a service entry for a compute host in a certain cell."""
         cell_name, host_name = cells_utils.split_cell_and_item(host_name)
@@ -265,7 +290,7 @@ class CellsManager(manager.Manager):
                                                                cell_name,
                                                                host_name)
         service = response.value_or_raise()
-        cells_utils.add_cell_to_service(service, response.cell_name)
+        service = cells_utils.add_cell_to_service(service, response.cell_name)
         return service
 
     def get_host_uptime(self, ctxt, host_name):
@@ -293,7 +318,7 @@ class CellsManager(manager.Manager):
         response = self.msg_runner.service_update(
             ctxt, cell_name, host_name, binary, params_to_update)
         service = response.value_or_raise()
-        cells_utils.add_cell_to_service(service, response.cell_name)
+        service = cells_utils.add_cell_to_service(service, response.cell_name)
         return service
 
     def service_delete(self, ctxt, cell_service_id):
@@ -302,6 +327,7 @@ class CellsManager(manager.Manager):
             cell_service_id)
         self.msg_runner.service_delete(ctxt, cell_name, service_id)
 
+    @oslo_messaging.expected_exceptions(exception.CellRoutingInconsistency)
     def proxy_rpc_to_manager(self, ctxt, topic, rpc_message, call, timeout):
         """Proxy an RPC message as-is to a manager."""
         compute_topic = CONF.compute_topic
@@ -345,6 +371,7 @@ class CellsManager(manager.Manager):
                 ret_task_logs.append(task_log)
         return ret_task_logs
 
+    @oslo_messaging.expected_exceptions(exception.CellRoutingInconsistency)
     def compute_node_get(self, ctxt, compute_id):
         """Get a compute node by ID in a specific cell."""
         cell_name, compute_id = cells_utils.split_cell_and_item(
@@ -352,7 +379,7 @@ class CellsManager(manager.Manager):
         response = self.msg_runner.compute_node_get(ctxt, cell_name,
                                                     compute_id)
         node = response.value_or_raise()
-        cells_utils.add_cell_to_compute_node(node, cell_name)
+        node = cells_utils.add_cell_to_compute_node(node, cell_name)
         return node
 
     def compute_node_get_all(self, ctxt, hypervisor_match=None):
@@ -365,8 +392,8 @@ class CellsManager(manager.Manager):
         for response in responses:
             nodes = response.value_or_raise()
             for node in nodes:
-                cells_utils.add_cell_to_compute_node(node,
-                                                     response.cell_name)
+                node = cells_utils.add_cell_to_compute_node(node,
+                                                            response.cell_name)
                 ret_nodes.append(node)
         return ret_nodes
 
@@ -376,7 +403,7 @@ class CellsManager(manager.Manager):
         totals = {}
         for response in responses:
             data = response.value_or_raise()
-            for key, val in data.iteritems():
+            for key, val in six.iteritems(data):
                 totals.setdefault(key, 0)
                 totals[key] += val
         return totals
@@ -404,11 +431,11 @@ class CellsManager(manager.Manager):
     def validate_console_port(self, ctxt, instance_uuid, console_port,
                               console_type):
         """Validate console port with child cell compute node."""
-        instance = self.db.instance_get_by_uuid(ctxt, instance_uuid)
-        if not instance['cell_name']:
+        instance = objects.Instance.get_by_uuid(ctxt, instance_uuid)
+        if not instance.cell_name:
             raise exception.InstanceUnknownCell(instance_uuid=instance_uuid)
         response = self.msg_runner.validate_console_port(ctxt,
-                instance['cell_name'], instance_uuid, console_port,
+                instance.cell_name, instance_uuid, console_port,
                 console_type)
         return response.value_or_raise()
 
@@ -417,6 +444,8 @@ class CellsManager(manager.Manager):
 
     def bdm_update_or_create_at_top(self, ctxt, bdm, create=None):
         """BDM was created/updated in this cell.  Tell the API cells."""
+        # TODO(ndipanov): Move inter-cell RPC to use objects
+        bdm = base_obj.obj_to_primitive(bdm)
         self.msg_runner.bdm_update_or_create_at_top(ctxt, bdm, create=create)
 
     def bdm_destroy_at_top(self, ctxt, instance_uuid, device_name=None,
@@ -453,10 +482,12 @@ class CellsManager(manager.Manager):
         """Start an instance in its cell."""
         self.msg_runner.start_instance(ctxt, instance)
 
-    def stop_instance(self, ctxt, instance, do_cast=True):
+    def stop_instance(self, ctxt, instance, do_cast=True,
+                      clean_shutdown=True):
         """Stop an instance in its cell."""
         response = self.msg_runner.stop_instance(ctxt, instance,
-                                                 do_cast=do_cast)
+                                                 do_cast=do_cast,
+                                                 clean_shutdown=clean_shutdown)
         if not do_cast:
             return response.value_or_raise()
 
@@ -492,19 +523,24 @@ class CellsManager(manager.Manager):
         """Resume an instance in its cell."""
         self.msg_runner.resume_instance(ctxt, instance)
 
-    def terminate_instance(self, ctxt, instance):
+    def terminate_instance(self, ctxt, instance, delete_type='delete'):
         """Delete an instance in its cell."""
-        self.msg_runner.terminate_instance(ctxt, instance)
+        # NOTE(rajesht): The `delete_type` parameter is passed so that it will
+        # be routed to destination cell, where instance deletion will happen.
+        self.msg_runner.terminate_instance(ctxt, instance,
+                                           delete_type=delete_type)
 
     def soft_delete_instance(self, ctxt, instance):
         """Soft-delete an instance in its cell."""
         self.msg_runner.soft_delete_instance(ctxt, instance)
 
     def resize_instance(self, ctxt, instance, flavor,
-                        extra_instance_updates):
+                        extra_instance_updates,
+                        clean_shutdown=True):
         """Resize an instance in its cell."""
         self.msg_runner.resize_instance(ctxt, instance,
-                                        flavor, extra_instance_updates)
+                                        flavor, extra_instance_updates,
+                                        clean_shutdown=clean_shutdown)
 
     def live_migrate_instance(self, ctxt, instance, block_migration,
                               disk_over_commit, host_name):
@@ -544,3 +580,22 @@ class CellsManager(manager.Manager):
         self.msg_runner.rebuild_instance(ctxt, instance, image_href,
                                          admin_password, files_to_inject,
                                          preserve_ephemeral, kwargs)
+
+    def set_admin_password(self, ctxt, instance, new_pass):
+        self.msg_runner.set_admin_password(ctxt, instance, new_pass)
+
+    def get_keypair_at_top(self, ctxt, user_id, name):
+        responses = self.msg_runner.get_keypair_at_top(ctxt, user_id, name)
+        keypairs = [resp.value for resp in responses if resp.value is not None]
+
+        if len(keypairs) == 0:
+            return None
+        elif len(keypairs) > 1:
+            cell_names = ', '.join([resp.cell_name for resp in responses
+                                    if resp.value is not None])
+            LOG.warning(_LW("The same keypair name '%(name)s' exists in the "
+                            "following cells: %(cell_names)s. The keypair "
+                            "value from the first cell is returned."),
+                        {'name': name, 'cell_names': cell_names})
+
+        return keypairs[0]

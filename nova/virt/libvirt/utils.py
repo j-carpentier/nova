@@ -20,18 +20,20 @@
 
 import errno
 import os
-import platform
+import re
 
 from lxml import etree
-from oslo.config import cfg
+from oslo_concurrency import processutils
+from oslo_config import cfg
+from oslo_log import log as logging
 
-from nova.openstack.common.gettextutils import _
-from nova.openstack.common.gettextutils import _LI
-from nova.openstack.common.gettextutils import _LW
-from nova.openstack.common import log as logging
-from nova.openstack.common import processutils
+from nova.compute import arch
+from nova.i18n import _
+from nova.i18n import _LI
 from nova import utils
 from nova.virt import images
+from nova.virt.libvirt import config as vconfig
+from nova.virt.libvirt.volume import remotefs
 from nova.virt import volumeutils
 
 libvirt_opts = [
@@ -53,103 +55,6 @@ def execute(*args, **kwargs):
 
 def get_iscsi_initiator():
     return volumeutils.get_iscsi_initiator()
-
-
-def get_fc_hbas():
-    """Get the Fibre Channel HBA information."""
-    out = None
-    try:
-        out, err = execute('systool', '-c', 'fc_host', '-v',
-                           run_as_root=True)
-    except processutils.ProcessExecutionError as exc:
-        # This handles the case where rootwrap is used
-        # and systool is not installed
-        # 96 = nova.cmd.rootwrap.RC_NOEXECFOUND:
-        if exc.exit_code == 96:
-            LOG.warn(_LW("systool is not installed"))
-        return []
-    except OSError as exc:
-        # This handles the case where rootwrap is NOT used
-        # and systool is not installed
-        if exc.errno == errno.ENOENT:
-            LOG.warn(_LW("systool is not installed"))
-        return []
-
-    if out is None:
-        raise RuntimeError(_("Cannot find any Fibre Channel HBAs"))
-
-    lines = out.split('\n')
-    # ignore the first 2 lines
-    lines = lines[2:]
-    hbas = []
-    hba = {}
-    lastline = None
-    for line in lines:
-        line = line.strip()
-        # 2 newlines denotes a new hba port
-        if line == '' and lastline == '':
-            if len(hba) > 0:
-                hbas.append(hba)
-                hba = {}
-        else:
-            val = line.split('=')
-            if len(val) == 2:
-                key = val[0].strip().replace(" ", "")
-                value = val[1].strip()
-                hba[key] = value.replace('"', '')
-        lastline = line
-
-    return hbas
-
-
-def get_fc_hbas_info():
-    """Get Fibre Channel WWNs and device paths from the system, if any."""
-    # Note modern linux kernels contain the FC HBA's in /sys
-    # and are obtainable via the systool app
-    hbas = get_fc_hbas()
-    hbas_info = []
-    for hba in hbas:
-        wwpn = hba['port_name'].replace('0x', '')
-        wwnn = hba['node_name'].replace('0x', '')
-        device_path = hba['ClassDevicepath']
-        device = hba['ClassDevice']
-        hbas_info.append({'port_name': wwpn,
-                          'node_name': wwnn,
-                          'host_device': device,
-                          'device_path': device_path})
-    return hbas_info
-
-
-def get_fc_wwpns():
-    """Get Fibre Channel WWPNs from the system, if any."""
-    # Note modern linux kernels contain the FC HBA's in /sys
-    # and are obtainable via the systool app
-    hbas = get_fc_hbas()
-
-    wwpns = []
-    if hbas:
-        for hba in hbas:
-            if hba['port_state'] == 'Online':
-                wwpn = hba['port_name'].replace('0x', '')
-                wwpns.append(wwpn)
-
-    return wwpns
-
-
-def get_fc_wwnns():
-    """Get Fibre Channel WWNNs from the system, if any."""
-    # Note modern linux kernels contain the FC HBA's in /sys
-    # and are obtainable via the systool app
-    hbas = get_fc_hbas()
-
-    wwnns = []
-    if hbas:
-        for hba in hbas:
-            if hba['port_state'] == 'Online':
-                wwnn = hba['node_name'].replace('0x', '')
-                wwnns.append(wwnn)
-
-    return wwnns
 
 
 def create_image(disk_format, path, size):
@@ -182,17 +87,13 @@ def create_cow_image(backing_file, path, size=None):
         base_details = images.qemu_img_info(backing_file)
     else:
         base_details = None
-    # This doesn't seem to get inherited so force it to...
-    # http://paste.ubuntu.com/1213295/
-    # TODO(harlowja) probably file a bug against qemu-img/qemu
+    # Explicitly inherit the value of 'cluster_size' property of a qcow2
+    # overlay image from its backing file. This can be useful in cases
+    # when people create a base image with a non-default 'cluster_size'
+    # value or cases when images were created with very old QEMU
+    # versions which had a different default 'cluster_size'.
     if base_details and base_details.cluster_size is not None:
         cow_opts += ['cluster_size=%s' % base_details.cluster_size]
-    # For now don't inherit this due the following discussion...
-    # See: http://www.gossamer-threads.com/lists/openstack/dev/10592
-    # if 'preallocation' in base_details:
-    #     cow_opts += ['preallocation=%s' % base_details['preallocation']]
-    if base_details and base_details.encrypted:
-        cow_opts += ['encryption=%s' % base_details.encrypted]
     if size is not None:
         cow_opts += ['size=%s' % size]
     if cow_opts:
@@ -203,55 +104,14 @@ def create_cow_image(backing_file, path, size=None):
     execute(*cmd)
 
 
-def import_rbd_image(*args):
-    execute('rbd', 'import', *args)
-
-
-def _run_rbd(*args, **kwargs):
-    total = list(args)
-
-    if CONF.libvirt.rbd_user:
-        total.extend(['--id', str(CONF.libvirt.rbd_user)])
-    if CONF.libvirt.images_rbd_ceph_conf:
-        total.extend(['--conf', str(CONF.libvirt.images_rbd_ceph_conf)])
-
-    return utils.execute(*total, **kwargs)
-
-
-def list_rbd_volumes(pool):
-    """List volumes names for given ceph pool.
-
-    :param pool: ceph pool name
-    """
-    try:
-        out, err = _run_rbd('rbd', '-p', pool, 'ls')
-    except processutils.ProcessExecutionError:
-        # No problem when no volume in rbd pool
-        return []
-
-    return [line.strip() for line in out.splitlines()]
-
-
-def remove_rbd_volumes(pool, *names):
-    """Remove one or more rbd volume."""
-    for name in names:
-        rbd_remove = ['rbd', '-p', pool, 'rm', name]
-        try:
-            _run_rbd(*rbd_remove, attempts=3, run_as_root=True)
-        except processutils.ProcessExecutionError:
-            LOG.warn(_LW("rbd remove %(name)s in pool %(pool)s failed"),
-                     {'name': name, 'pool': pool})
-
-
 def pick_disk_driver_name(hypervisor_version, is_block_dev=False):
     """Pick the libvirt primary backend driver name
 
-    If the hypervisor supports multiple backend drivers, then the name
-    attribute selects the primary backend driver name, while the optional
-    type attribute provides the sub-type.  For example, xen supports a name
-    of "tap", "tap2", "phy", or "file", with a type of "aio" or "qcow2",
-    while qemu only supports a name of "qemu", but multiple types including
-    "raw", "bochs", "qcow2", and "qed".
+    If the hypervisor supports multiple backend drivers we have to tell libvirt
+    which one should be used.
+
+    Xen supports the following drivers: "tap", "tap2", "phy", "file", or
+    "qemu", being "qemu" the preferred one. Qemu only supports "qemu".
 
     :param is_block_dev:
     :returns: driver_name or None
@@ -260,12 +120,39 @@ def pick_disk_driver_name(hypervisor_version, is_block_dev=False):
         if is_block_dev:
             return "phy"
         else:
-            # 4000000 == 4.0.0
-            if hypervisor_version == 4000000:
-                return "tap"
-            else:
-                return "tap2"
-
+            # 4002000 == 4.2.0
+            if hypervisor_version >= 4002000:
+                try:
+                    execute('xend', 'status',
+                            run_as_root=True, check_exit_code=True)
+                except OSError as exc:
+                    if exc.errno == errno.ENOENT:
+                        LOG.debug("xend is not found")
+                        # libvirt will try to use libxl toolstack
+                        return 'qemu'
+                    else:
+                        raise
+                except processutils.ProcessExecutionError:
+                    LOG.debug("xend is not started")
+                    # libvirt will try to use libxl toolstack
+                    return 'qemu'
+            # libvirt will use xend/xm toolstack
+            try:
+                out, err = execute('tap-ctl', 'check', check_exit_code=False)
+                if out == 'ok\n':
+                    # 4000000 == 4.0.0
+                    if hypervisor_version > 4000000:
+                        return "tap2"
+                    else:
+                        return "tap"
+                else:
+                    LOG.info(_LI("tap-ctl check: %s"), out)
+            except OSError as exc:
+                if exc.errno == errno.ENOENT:
+                    LOG.debug("tap-ctl tool is not installed")
+                else:
+                    raise
+            return "file"
     elif CONF.libvirt.virt_type in ('kvm', 'qemu'):
         return "qemu"
     else:
@@ -297,12 +184,19 @@ def get_disk_backing_file(path, basename=True):
     return backing_file
 
 
-def copy_image(src, dest, host=None):
+def copy_image(src, dest, host=None, receive=False,
+               on_execute=None, on_completion=None,
+               compression=True):
     """Copy a disk image to an existing directory
 
     :param src: Source image
     :param dest: Destination path
     :param host: Remote host
+    :param receive: Reverse the rsync direction
+    :param on_execute: Callback method to store pid of process in cache
+    :param on_completion: Callback method to remove pid of process from cache
+    :param compression: Allows to use rsync operation with or without
+                        compression
     """
 
     if not host:
@@ -312,20 +206,15 @@ def copy_image(src, dest, host=None):
         # coreutils 8.11, holes can be read efficiently too.
         execute('cp', src, dest)
     else:
-        dest = "%s:%s" % (host, dest)
-        # Try rsync first as that can compress and create sparse dest files.
-        # Note however that rsync currently doesn't read sparse files
-        # efficiently: https://bugzilla.samba.org/show_bug.cgi?id=8918
-        # At least network traffic is mitigated with compression.
-        try:
-            # Do a relatively light weight test first, so that we
-            # can fall back to scp, without having run out of space
-            # on the destination for example.
-            execute('rsync', '--sparse', '--compress', '--dry-run', src, dest)
-        except processutils.ProcessExecutionError:
-            execute('scp', src, dest)
+        if receive:
+            src = "%s:%s" % (utils.safe_ip_format(host), src)
         else:
-            execute('rsync', '--sparse', '--compress', src, dest)
+            dest = "%s:%s" % (utils.safe_ip_format(host), dest)
+
+        remote_filesystem_driver = remotefs.RemoteFilesystem()
+        remote_filesystem_driver.copy_file(src, dest,
+            on_execute=on_execute, on_completion=on_completion,
+            compression=compression)
 
 
 def write_to_file(path, contents, umask=None):
@@ -353,6 +242,27 @@ def chown(path, owner):
     :param owner: Desired new owner (given as uid or username)
     """
     execute('chown', owner, path, run_as_root=True)
+
+
+def _id_map_to_config(id_map):
+    return "%s:%s:%s" % (id_map.start, id_map.target, id_map.count)
+
+
+def chown_for_id_maps(path, id_maps):
+    """Change ownership of file or directory for an id mapped
+    environment
+
+    :param path: File or directory whose ownership to change
+    :param id_maps: List of type LibvirtConfigGuestIDMap
+    """
+    uid_maps_str = ','.join([_id_map_to_config(id_map) for id_map in id_maps if
+                             isinstance(id_map,
+                                        vconfig.LibvirtConfigGuestUIDMap)])
+    gid_maps_str = ','.join([_id_map_to_config(id_map) for id_map in id_maps if
+                             isinstance(id_map,
+                                        vconfig.LibvirtConfigGuestGIDMap)])
+    execute('nova-idmapshift', '-i', '-u', uid_maps_str,
+            '-g', gid_maps_str, path, run_as_root=True)
 
 
 def extract_snapshot(disk_path, source_fmt, out_path, dest_fmt):
@@ -405,6 +315,16 @@ def file_delete(path):
           state at all (for unit tests)
     """
     return os.unlink(path)
+
+
+def path_exists(path):
+    """Returns if path exists
+
+    Note: The reason this is kept in a separate module is to easily
+          be able to provide a stub module that doesn't alter system
+          state at all (for unit tests)
+    """
+    return os.path.exists(path)
 
 
 def find_disk(virt_dom):
@@ -482,15 +402,42 @@ def get_instance_path(instance, forceold=False, relative=False):
 
     :returns: a path to store information about that instance
     """
-    pre_grizzly_name = os.path.join(CONF.instances_path, instance['name'])
+    pre_grizzly_name = os.path.join(CONF.instances_path, instance.name)
     if forceold or os.path.exists(pre_grizzly_name):
         if relative:
-            return instance['name']
+            return instance.name
         return pre_grizzly_name
 
     if relative:
-        return instance['uuid']
-    return os.path.join(CONF.instances_path, instance['uuid'])
+        return instance.uuid
+    return os.path.join(CONF.instances_path, instance.uuid)
+
+
+def get_instance_path_at_destination(instance, migrate_data=None):
+    """Get the the instance path on destination node while live migration.
+
+    This method determines the directory name for instance storage on
+    destination node, while live migration.
+
+    :param instance: the instance we want a path for
+    :param migrate_data: if not None, it is a dict which holds data
+                         required for live migration without shared
+                         storage.
+
+    :returns: a path to store information about that instance
+    """
+    instance_relative_path = None
+    if migrate_data:
+        instance_relative_path = migrate_data.get('instance_relative_path')
+    # NOTE(mikal): this doesn't use libvirt_utils.get_instance_path
+    # because we are ensuring that the same instance directory name
+    # is used as was at the source
+    if instance_relative_path:
+        instance_dir = os.path.join(CONF.instances_path,
+                                    instance_relative_path)
+    else:
+        instance_dir = get_instance_path(instance)
+    return instance_dir
 
 
 def get_arch(image_meta):
@@ -506,11 +453,11 @@ def get_arch(image_meta):
     :returns: guest (or host) architecture
     """
     if image_meta:
-        arch = image_meta.get('properties', {}).get('architecture')
-        if arch is not None:
-            return arch
+        image_arch = image_meta.properties.get('hw_architecture')
+        if image_arch is not None:
+            return image_arch
 
-    return platform.processor()
+    return arch.from_host()
 
 
 def is_mounted(mount_path, source=None):
@@ -522,10 +469,14 @@ def is_mounted(mount_path, source=None):
 
         utils.execute(*check_cmd)
         return True
-    except processutils.ProcessExecutionError as exc:
+    except processutils.ProcessExecutionError:
         return False
     except OSError as exc:
-        #info since it's not required to have this tool.
+        # info since it's not required to have this tool.
         if exc.errno == errno.ENOENT:
             LOG.info(_LI("findmnt tool is not installed"))
         return False
+
+
+def is_valid_hostname(hostname):
+    return re.match(r"^[\w\-\.:]+$", hostname)

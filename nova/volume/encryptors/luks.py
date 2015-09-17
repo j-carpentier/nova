@@ -14,15 +14,35 @@
 #    under the License.
 
 
-import re
+from oslo_concurrency import processutils
+from oslo_log import log as logging
 
-from nova.openstack.common import log as logging
-from nova.openstack.common import processutils
+from nova.i18n import _LI
+from nova.i18n import _LW
 from nova import utils
 from nova.volume.encryptors import cryptsetup
 
 
 LOG = logging.getLogger(__name__)
+
+
+def is_luks(device):
+    """Checks if the specified device uses LUKS for encryption.
+
+    :param device: the device to check
+    :returns: true if the specified device uses LUKS; false otherwise
+    """
+    try:
+        # check to see if the device uses LUKS: exit status is 0
+        # if the device is a LUKS partition and non-zero if not
+        utils.execute('cryptsetup', 'isLuks', '--verbose', device,
+                      run_as_root=True, check_exit_code=True)
+        return True
+    except processutils.ProcessExecutionError as e:
+        LOG.warning(_LW("isLuks exited abnormally (status %(exit_code)s): "
+                        "%(stderr)s"),
+                    {"exit_code": e.exit_code, "stderr": e.stderr})
+        return False
 
 
 class LuksEncryptor(cryptsetup.CryptsetupEncryptor):
@@ -55,7 +75,7 @@ class LuksEncryptor(cryptsetup.CryptsetupEncryptor):
         cmd.extend([self.dev_path])
 
         utils.execute(*cmd, process_input=passphrase,
-                      check_exit_code=True, run_as_root=True)
+                      check_exit_code=True, run_as_root=True, attempts=3)
 
     def _open_volume(self, passphrase, **kwargs):
         """Opens the LUKS partition on the volume using the specified
@@ -85,9 +105,11 @@ class LuksEncryptor(cryptsetup.CryptsetupEncryptor):
         try:
             self._open_volume(passphrase, **kwargs)
         except processutils.ProcessExecutionError as e:
-            pattern = re.compile('Device \S+ is not a valid LUKS device.')
-            if e.exit_code == 1 and pattern.search(e.stderr):
+            if e.exit_code == 1 and not is_luks(self.dev_path):
                 # the device has never been formatted; format it and try again
+                LOG.info(_LI("%s is not a valid LUKS device;"
+                             " formatting device for first use"),
+                         self.dev_path)
                 self._format_volume(passphrase, **kwargs)
                 self._open_volume(passphrase, **kwargs)
             else:
@@ -102,4 +124,5 @@ class LuksEncryptor(cryptsetup.CryptsetupEncryptor):
         """Closes the device (effectively removes the dm-crypt mapping)."""
         LOG.debug("closing encrypted volume %s", self.dev_path)
         utils.execute('cryptsetup', 'luksClose', self.dev_name,
-                      run_as_root=True, check_exit_code=True)
+                      run_as_root=True, check_exit_code=True,
+                      attempts=3)

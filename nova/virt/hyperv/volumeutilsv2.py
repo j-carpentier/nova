@@ -24,10 +24,11 @@ import time
 if sys.platform == 'win32':
     import wmi
 
-from oslo.config import cfg
+from oslo_config import cfg
+from oslo_log import log as logging
+from six.moves import range
 
-from nova.openstack.common.gettextutils import _
-from nova.openstack.common import log as logging
+from nova.i18n import _
 from nova import utils
 from nova.virt.hyperv import basevolumeutils
 from nova.virt.hyperv import vmutils
@@ -37,6 +38,8 @@ CONF = cfg.CONF
 
 
 class VolumeUtilsV2(basevolumeutils.BaseVolumeUtils):
+    _CHAP_AUTH_TYPE = 'ONEWAYCHAP'
+
     def __init__(self, host='.'):
         super(VolumeUtilsV2, self).__init__(host)
 
@@ -62,7 +65,8 @@ class VolumeUtilsV2(basevolumeutils.BaseVolumeUtils):
             portal.New(TargetPortalAddress=target_address,
                        TargetPortalPortNumber=target_port)
 
-    def login_storage_target(self, target_lun, target_iqn, target_portal):
+    def login_storage_target(self, target_lun, target_iqn, target_portal,
+                             auth_username=None, auth_password=None):
         """Ensure that the target is logged in."""
 
         self._login_target_portal(target_portal)
@@ -75,7 +79,7 @@ class VolumeUtilsV2(basevolumeutils.BaseVolumeUtils):
         if retry_count < 2:
             retry_count = 2
 
-        for attempt in xrange(retry_count):
+        for attempt in range(retry_count):
             target = self._conn_storage.query("SELECT * FROM MSFT_iSCSITarget "
                                               "WHERE NodeAddress='%s' " %
                                               target_iqn)
@@ -88,8 +92,13 @@ class VolumeUtilsV2(basevolumeutils.BaseVolumeUtils):
                 return
             try:
                 target = self._conn_storage.MSFT_iSCSITarget
+                auth = {}
+                if auth_username and auth_password:
+                    auth['AuthenticationType'] = self._CHAP_AUTH_TYPE
+                    auth['ChapUsername'] = auth_username
+                    auth['ChapSecret'] = auth_password
                 target.Connect(NodeAddress=target_iqn,
-                               IsPersistent=True)
+                               IsPersistent=True, **auth)
                 time.sleep(CONF.hyperv.volume_attach_retry_interval)
             except wmi.x_wmi as exc:
                 LOG.debug("Attempt %(attempt)d to connect to target  "

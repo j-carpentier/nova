@@ -13,10 +13,10 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from oslo.config import cfg
+from oslo_config import cfg
+from oslo_log import log as logging
 
-from nova.openstack.common.gettextutils import _
-from nova.openstack.common import log as logging
+from nova.i18n import _LW
 from nova.scheduler import filters
 from nova import servicegroup
 
@@ -44,7 +44,7 @@ class ComputeFilter(filters.BaseHostFilter):
             return False
         else:
             if not self.servicegroup_api.service_is_up(service):
-                LOG.warn(_("%(host_state)s has not been heard from in a "
-                           "while"), {'host_state': host_state})
+                LOG.warning(_LW("%(host_state)s has not been heard from in a "
+                                "while"), {'host_state': host_state})
                 return False
         return True

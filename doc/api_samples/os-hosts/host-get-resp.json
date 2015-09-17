@@ -4,7 +4,7 @@
             "resource": {
                 "cpu": 1,
                 "disk_gb": 1028,
-                "host": "5ca60c6792a1442f9471ff575443f94d",
+                "host": "c1a7de0ac9d94e4baceae031d05caae3",
                 "memory_mb": 8192,
                 "project": "(total)"
             }
@@ -13,7 +13,7 @@
             "resource": {
                 "cpu": 0,
                 "disk_gb": 0,
-                "host": "5ca60c6792a1442f9471ff575443f94d",
+                "host": "c1a7de0ac9d94e4baceae031d05caae3",
                 "memory_mb": 512,
                 "project": "(used_now)"
             }
@@ -22,7 +22,7 @@
             "resource": {
                 "cpu": 0,
                 "disk_gb": 0,
-                "host": "5ca60c6792a1442f9471ff575443f94d",
+                "host": "c1a7de0ac9d94e4baceae031d05caae3",
                 "memory_mb": 0,
                 "project": "(used_max)"
             }

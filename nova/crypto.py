@@ -23,24 +23,28 @@ Includes root and intermediate CAs, SSH key_pairs and x509 certificates.
 from __future__ import absolute_import
 
 import base64
+import binascii
 import os
-import re
-import string
-import struct
 
-from oslo.config import cfg
-from pyasn1.codec.der import encoder as der_encoder
-from pyasn1.type import univ
+from cryptography import exceptions
+from cryptography.hazmat import backends
+from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives import serialization
+from cryptography import x509
+from oslo_concurrency import processutils
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_utils import excutils
+from oslo_utils import fileutils
+from oslo_utils import timeutils
+import paramiko
+import six
 
 from nova import context
 from nova import db
 from nova import exception
-from nova.openstack.common import excutils
-from nova.openstack.common import fileutils
-from nova.openstack.common.gettextutils import _
-from nova.openstack.common import log as logging
-from nova.openstack.common import processutils
-from nova.openstack.common import timeutils
+from nova.i18n import _, _LE
 from nova import paths
 from nova import utils
 
@@ -117,48 +121,54 @@ def ensure_ca_filesystem():
         genrootca_sh_path = os.path.abspath(
                 os.path.join(os.path.dirname(__file__), 'CA', 'genrootca.sh'))
 
-        start = os.getcwd()
         fileutils.ensure_tree(ca_dir)
-        os.chdir(ca_dir)
-        utils.execute("sh", genrootca_sh_path)
-        os.chdir(start)
-
-
-def _generate_fingerprint(public_key_file):
-    (out, err) = utils.execute('ssh-keygen', '-q', '-l', '-f', public_key_file)
-    fingerprint = out.split(' ')[1]
-    return fingerprint
+        utils.execute("sh", genrootca_sh_path, cwd=ca_dir)
 
 
 def generate_fingerprint(public_key):
-    with utils.tempdir() as tmpdir:
-        try:
-            pubfile = os.path.join(tmpdir, 'temp.pub')
-            with open(pubfile, 'w') as f:
-                f.write(public_key)
-            return _generate_fingerprint(pubfile)
-        except processutils.ProcessExecutionError:
-            raise exception.InvalidKeypair(
-                reason=_('failed to generate fingerprint'))
+    try:
+        pub_bytes = public_key.encode('utf-8')
+        # Test that the given public_key string is a proper ssh key. The
+        # returned object is unused since pyca/cryptography does not have a
+        # fingerprint method.
+        serialization.load_ssh_public_key(
+            pub_bytes, backends.default_backend())
+        pub_data = base64.b64decode(public_key.split(' ')[1])
+        digest = hashes.Hash(hashes.MD5(), backends.default_backend())
+        digest.update(pub_data)
+        md5hash = digest.finalize()
+        raw_fp = binascii.hexlify(md5hash)
+        if six.PY3:
+            raw_fp = raw_fp.decode('ascii')
+        return ':'.join(a + b for a, b in zip(raw_fp[::2], raw_fp[1::2]))
+    except Exception:
+        raise exception.InvalidKeypair(
+            reason=_('failed to generate fingerprint'))
 
 
-def generate_key_pair(bits=None):
-    with utils.tempdir() as tmpdir:
-        keyfile = os.path.join(tmpdir, 'temp')
-        args = ['ssh-keygen', '-q', '-N', '', '-t', 'rsa',
-                '-f', keyfile, '-C', 'Generated-by-Nova']
-        if bits is not None:
-            args.extend(['-b', bits])
-        utils.execute(*args)
-        fingerprint = _generate_fingerprint('%s.pub' % (keyfile))
-        if not os.path.exists(keyfile):
-            raise exception.FileNotFound(keyfile)
-        private_key = open(keyfile).read()
-        public_key_path = keyfile + '.pub'
-        if not os.path.exists(public_key_path):
-            raise exception.FileNotFound(public_key_path)
-        public_key = open(public_key_path).read()
+def generate_x509_fingerprint(pem_key):
+    try:
+        if isinstance(pem_key, six.text_type):
+            pem_key = pem_key.encode('utf-8')
+        cert = x509.load_pem_x509_certificate(
+            pem_key, backends.default_backend())
+        raw_fp = binascii.hexlify(cert.fingerprint(hashes.SHA1()))
+        if six.PY3:
+            raw_fp = raw_fp.decode('ascii')
+        return ':'.join(a + b for a, b in zip(raw_fp[::2], raw_fp[1::2]))
+    except (ValueError, TypeError, binascii.Error) as ex:
+        raise exception.InvalidKeypair(
+            reason=_('failed to generate X509 fingerprint. '
+                     'Error message: %s') % ex)
 
+
+def generate_key_pair(bits=2048):
+    key = paramiko.RSAKey.generate(bits)
+    keyout = six.StringIO()
+    key.write_private_key(keyout)
+    private_key = keyout.getvalue()
+    public_key = '%s %s Generated-by-Nova' % (key.get_name(), key.get_base64())
+    fingerprint = generate_fingerprint(public_key)
     return (private_key, public_key, fingerprint)
 
 
@@ -174,118 +184,47 @@ def fetch_crl(project_id):
 
 
 def decrypt_text(project_id, text):
-    private_key = key_path(project_id)
-    if not os.path.exists(private_key):
+    private_key_file = key_path(project_id)
+    if not os.path.exists(private_key_file):
         raise exception.ProjectNotFound(project_id=project_id)
+    with open(private_key_file, 'rb') as f:
+        data = f.read()
     try:
-        dec, _err = utils.execute('openssl',
-                                  'rsautl',
-                                  '-decrypt',
-                                  '-inkey', '%s' % private_key,
-                                  process_input=text)
-        return dec
-    except processutils.ProcessExecutionError as exc:
-        raise exception.DecryptionFailure(reason=exc.stderr)
-
-
-_RSA_OID = univ.ObjectIdentifier('1.2.840.113549.1.1.1')
-
-
-def _to_sequence(*vals):
-    seq = univ.Sequence()
-    for i in range(len(vals)):
-        seq.setComponentByPosition(i, vals[i])
-    return seq
-
-
-def convert_from_sshrsa_to_pkcs8(pubkey):
-    """Convert a ssh public key to openssl format
-       Equivalent to the ssh-keygen's -m option
-    """
-    # get the second field from the public key file.
-    try:
-        keydata = base64.b64decode(pubkey.split(None)[1])
-    except IndexError:
-        msg = _("Unable to find the key")
-        raise exception.EncryptionFailure(reason=msg)
-
-    # decode the parts of the key
-    parts = []
-    while keydata:
-        dlen = struct.unpack('>I', keydata[:4])[0]
-        data = keydata[4:dlen + 4]
-        keydata = keydata[4 + dlen:]
-        parts.append(data)
-
-    # Use asn to build the openssl key structure
-    #
-    #  SEQUENCE(2 elem)
-    #    +- SEQUENCE(2 elem)
-    #    |    +- OBJECT IDENTIFIER (1.2.840.113549.1.1.1)
-    #    |    +- NULL
-    #    +- BIT STRING(1 elem)
-    #         +- SEQUENCE(2 elem)
-    #              +- INTEGER(2048 bit)
-    #              +- INTEGER 65537
-
-    # Build the sequence for the bit string
-    n_val = int(
-        ''.join(['%02X' % struct.unpack('B', x)[0] for x in parts[2]]), 16)
-    e_val = int(
-        ''.join(['%02X' % struct.unpack('B', x)[0] for x in parts[1]]), 16)
-    pkinfo = _to_sequence(univ.Integer(n_val), univ.Integer(e_val))
-
-    # Convert the sequence into a bit string
-    pklong = long(der_encoder.encode(pkinfo).encode('hex'), 16)
-    pkbitstring = univ.BitString("'00%s'B" % bin(pklong)[2:])
-
-    # Build the key data structure
-    oid = _to_sequence(_RSA_OID, univ.Null())
-    pkcs1_seq = _to_sequence(oid, pkbitstring)
-    pkcs8 = base64.encodestring(der_encoder.encode(pkcs1_seq))
-
-    # Remove the embedded new line and format the key, each line
-    # should be 64 characters long
-    return ('-----BEGIN PUBLIC KEY-----\n%s\n-----END PUBLIC KEY-----\n' %
-            re.sub("(.{64})", "\\1\n", pkcs8.replace('\n', ''), re.DOTALL))
+        priv_key = serialization.load_pem_private_key(
+            data, None, backends.default_backend())
+        return priv_key.decrypt(text, padding.PKCS1v15())
+    except (ValueError, TypeError, exceptions.UnsupportedAlgorithm) as exc:
+        raise exception.DecryptionFailure(reason=six.text_type(exc))
 
 
 def ssh_encrypt_text(ssh_public_key, text):
     """Encrypt text with an ssh public key.
+
+    If text is a Unicode string, encode it to UTF-8.
     """
-    with utils.tempdir() as tmpdir:
-        sslkey = os.path.abspath(os.path.join(tmpdir, 'ssl.key'))
-        try:
-            out = convert_from_sshrsa_to_pkcs8(ssh_public_key)
-            with open(sslkey, 'w') as f:
-                f.write(out)
-            enc, _err = utils.execute('openssl',
-                                      'rsautl',
-                                      '-encrypt',
-                                      '-pubin',
-                                      '-inkey', sslkey,
-                                      '-keyform', 'PEM',
-                                      process_input=text)
-            return enc
-        except processutils.ProcessExecutionError as exc:
-            raise exception.EncryptionFailure(reason=exc.stderr)
+    if isinstance(text, six.text_type):
+        text = text.encode('utf-8')
+    try:
+        pub_bytes = ssh_public_key.encode('utf-8')
+        pub_key = serialization.load_ssh_public_key(
+            pub_bytes, backends.default_backend())
+        return pub_key.encrypt(text, padding.PKCS1v15())
+    except Exception as exc:
+        raise exception.EncryptionFailure(reason=six.text_type(exc))
 
 
 def revoke_cert(project_id, file_name):
     """Revoke a cert by file name."""
-    start = os.getcwd()
-    if not os.chdir(ca_folder(project_id)):
-        raise exception.ProjectNotFound(project_id=project_id)
     try:
         # NOTE(vish): potential race condition here
         utils.execute('openssl', 'ca', '-config', './openssl.cnf', '-revoke',
-                      file_name)
+                      file_name, cwd=ca_folder(project_id))
         utils.execute('openssl', 'ca', '-gencrl', '-config', './openssl.cnf',
-                      '-out', CONF.crl_file)
+                      '-out', CONF.crl_file, cwd=ca_folder(project_id))
+    except OSError:
+        raise exception.ProjectNotFound(project_id=project_id)
     except processutils.ProcessExecutionError:
         raise exception.RevokeCertFailure(project_id=project_id)
-    finally:
-        os.chdir(start)
 
 
 def revoke_certs_by_user(user_id):
@@ -322,7 +261,7 @@ def _user_cert_subject(user_id, project_id):
     return CONF.user_cert_subject % (project_id, user_id, timeutils.isotime())
 
 
-def generate_x509_cert(user_id, project_id, bits=1024):
+def generate_x509_cert(user_id, project_id, bits=2048):
     """Generate and sign a cert for user in project."""
     subject = _user_cert_subject(user_id, project_id)
 
@@ -332,8 +271,10 @@ def generate_x509_cert(user_id, project_id, bits=1024):
         utils.execute('openssl', 'genrsa', '-out', keyfile, str(bits))
         utils.execute('openssl', 'req', '-new', '-key', keyfile, '-out',
                       csrfile, '-batch', '-subj', subject)
-        private_key = open(keyfile).read()
-        csr = open(csrfile).read()
+        with open(keyfile) as f:
+            private_key = f.read()
+        with open(csrfile) as f:
+            csr = f.read()
 
     (serial, signed_csr) = sign_csr(csr, project_id)
     fname = os.path.join(ca_folder(project_id), 'newcerts/%s.pem' % serial)
@@ -344,15 +285,55 @@ def generate_x509_cert(user_id, project_id, bits=1024):
     return (private_key, signed_csr)
 
 
+def generate_winrm_x509_cert(user_id, bits=2048):
+    """Generate a cert for passwordless auth for user in project."""
+    subject = '/CN=%s' % user_id
+    upn = '%s@localhost' % user_id
+
+    with utils.tempdir() as tmpdir:
+        keyfile = os.path.abspath(os.path.join(tmpdir, 'temp.key'))
+        conffile = os.path.abspath(os.path.join(tmpdir, 'temp.conf'))
+
+        _create_x509_openssl_config(conffile, upn)
+
+        (certificate, _err) = utils.execute(
+             'openssl', 'req', '-x509', '-nodes', '-days', '3650',
+             '-config', conffile, '-newkey', 'rsa:%s' % bits,
+             '-outform', 'PEM', '-keyout', keyfile, '-subj', subject,
+             '-extensions', 'v3_req_client',
+             binary=True)
+
+        (out, _err) = utils.execute('openssl', 'pkcs12', '-export',
+                                    '-inkey', keyfile, '-password', 'pass:',
+                                    process_input=certificate,
+                                    binary=True)
+
+        private_key = base64.b64encode(out)
+        fingerprint = generate_x509_fingerprint(certificate)
+        if six.PY3:
+            private_key = private_key.decode('ascii')
+            certificate = certificate.decode('utf-8')
+
+    return (private_key, certificate, fingerprint)
+
+
+def _create_x509_openssl_config(conffile, upn):
+    content = ("distinguished_name  = req_distinguished_name\n"
+               "[req_distinguished_name]\n"
+               "[v3_req_client]\n"
+               "extendedKeyUsage = clientAuth\n"
+               "subjectAltName = otherName:""1.3.6.1.4.1.311.20.2.3;UTF8:%s\n")
+
+    with open(conffile, 'w') as file:
+        file.write(content % upn)
+
+
 def _ensure_project_folder(project_id):
     if not os.path.exists(ca_path(project_id)):
         geninter_sh_path = os.path.abspath(
                 os.path.join(os.path.dirname(__file__), 'CA', 'geninter.sh'))
-        start = os.getcwd()
-        os.chdir(ca_folder())
         utils.execute('sh', geninter_sh_path, project_id,
-                      _project_cert_subject(project_id))
-        os.chdir(start)
+                      _project_cert_subject(project_id), cwd=ca_folder())
 
 
 def generate_vpn_files(project_id):
@@ -393,20 +374,17 @@ def _sign_csr(csr_text, ca_folder):
                 csrfile.write(csr_text)
         except IOError:
             with excutils.save_and_reraise_exception():
-                LOG.exception(_('Failed to write inbound.csr'))
+                LOG.exception(_LE('Failed to write inbound.csr'))
 
         LOG.debug('Flags path: %s', ca_folder)
-        start = os.getcwd()
 
         # Change working dir to CA
         fileutils.ensure_tree(ca_folder)
-        os.chdir(ca_folder)
         utils.execute('openssl', 'ca', '-batch', '-out', outbound, '-config',
-                      './openssl.cnf', '-infiles', inbound)
+                      './openssl.cnf', '-infiles', inbound, cwd=ca_folder)
         out, _err = utils.execute('openssl', 'x509', '-in', outbound,
-                                  '-serial', '-noout')
-        serial = string.strip(out.rpartition('=')[2])
-        os.chdir(start)
+                                  '-serial', '-noout', cwd=ca_folder)
+        serial = out.rpartition('=')[2].strip()
 
         with open(outbound, 'r') as crtfile:
             return (serial, crtfile.read())

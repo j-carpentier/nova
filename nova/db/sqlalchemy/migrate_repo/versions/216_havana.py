@@ -14,14 +14,14 @@
 
 from migrate.changeset import UniqueConstraint
 from migrate import ForeignKeyConstraint
+from oslo_log import log as logging
 from sqlalchemy import Boolean, BigInteger, Column, DateTime, Enum, Float
 from sqlalchemy import dialects
 from sqlalchemy import ForeignKey, Index, Integer, MetaData, String, Table
 from sqlalchemy import Text
 from sqlalchemy.types import NullType
 
-from nova.openstack.common.gettextutils import _
-from nova.openstack.common import log as logging
+from nova.i18n import _LE
 
 LOG = logging.getLogger(__name__)
 
@@ -50,7 +50,7 @@ def InetSmall():
 def _create_shadow_tables(migrate_engine):
     meta = MetaData(migrate_engine)
     meta.reflect(migrate_engine)
-    table_names = meta.tables.keys()
+    table_names = list(meta.tables.keys())
 
     meta.bind = migrate_engine
 
@@ -81,7 +81,7 @@ def _create_shadow_tables(migrate_engine):
             shadow_table.create()
         except Exception:
             LOG.info(repr(shadow_table))
-            LOG.exception(_('Exception while creating table.'))
+            LOG.exception(_LE('Exception while creating table.'))
             raise
 
 
@@ -96,7 +96,7 @@ def _populate_instance_types(instance_types_table):
 
     try:
         i = instance_types_table.insert()
-        for name, values in default_inst_types.iteritems():
+        for name, values in default_inst_types.items():
             i.execute({'name': name, 'memory_mb': values["mem"],
                         'vcpus': values["vcpus"], 'deleted': 0,
                         'root_gb': values["root_gb"],
@@ -108,7 +108,7 @@ def _populate_instance_types(instance_types_table):
                         'is_public': True})
     except Exception:
         LOG.info(repr(instance_types_table))
-        LOG.exception(_('Exception while seeding instance_types table'))
+        LOG.exception(_LE('Exception while seeding instance_types table'))
         raise
 
 
@@ -328,6 +328,14 @@ def upgrade(migrate_engine):
         mysql_charset='utf8'
     )
 
+    # NOTE(mriedem): DB2 can't create the FK since we don't have the unique
+    # constraint on instances.uuid because it's nullable (so a unique
+    # constraint isn't created for instances.uuid, only a unique index).
+    consoles_instance_uuid_column_args = ['instance_uuid', String(length=36)]
+    if migrate_engine.name != 'ibm_db_sa':
+        consoles_instance_uuid_column_args.append(
+            ForeignKey('instances.uuid', name='consoles_instance_uuid_fkey'))
+
     consoles = Table('consoles', meta,
         Column('created_at', DateTime),
         Column('updated_at', DateTime),
@@ -337,9 +345,7 @@ def upgrade(migrate_engine):
         Column('password', String(length=255)),
         Column('port', Integer),
         Column('pool_id', Integer, ForeignKey('console_pools.id')),
-        Column('instance_uuid', String(length=36),
-               ForeignKey('instances.uuid',
-                          name='consoles_instance_uuid_fkey')),
+        Column(*consoles_instance_uuid_column_args),
         Column('deleted', Integer),
         mysql_engine='InnoDB',
         mysql_charset='utf8'
@@ -1100,7 +1106,7 @@ def upgrade(migrate_engine):
             table.create()
         except Exception:
             LOG.info(repr(table))
-            LOG.exception(_('Exception while creating table.'))
+            LOG.exception(_LE('Exception while creating table.'))
             raise
 
     # task log unique constraint
@@ -1455,39 +1461,30 @@ def upgrade(migrate_engine):
         'block_device_mapping_instance_uuid_virtual_name_device_name_idx'
     ]
 
+    # NOTE(mriedem): DB2 doesn't allow duplicate indexes either.
+    DB2_INDEX_SKIPS = POSTGRES_INDEX_SKIPS
+
     MYSQL_INDEX_SKIPS = [
         # we create this one manually for MySQL above
         'migrations_by_host_nodes_and_status_idx'
     ]
 
     for index in common_indexes:
-        if migrate_engine.name == 'postgresql' and \
-            index.name in POSTGRES_INDEX_SKIPS:
-            continue
-        if migrate_engine.name == 'mysql' and \
-            index.name in MYSQL_INDEX_SKIPS:
+        if ((migrate_engine.name == 'postgresql' and
+                index.name in POSTGRES_INDEX_SKIPS) or
+            (migrate_engine.name == 'mysql' and
+                index.name in MYSQL_INDEX_SKIPS) or
+            (migrate_engine.name == 'ibm_db_sa' and
+                index.name in DB2_INDEX_SKIPS)):
             continue
         else:
             index.create(migrate_engine)
 
     Index('project_id', dns_domains.c.project_id).drop
 
+    # Common foreign keys
     fkeys = [
-              [[fixed_ips.c.instance_uuid],
-                  [instances.c.uuid],
-                  'fixed_ips_instance_uuid_fkey'],
-              [[block_device_mapping.c.instance_uuid],
-                  [instances.c.uuid],
-                  'block_device_mapping_instance_uuid_fkey'],
-              [[instance_info_caches.c.instance_uuid],
-                  [instances.c.uuid],
-                  'instance_info_caches_instance_uuid_fkey'],
-              [[instance_metadata.c.instance_uuid],
-                  [instances.c.uuid],
-                  'instance_metadata_instance_uuid_fkey'],
-              [[instance_system_metadata.c.instance_uuid],
-                  [instances.c.uuid],
-                  'instance_system_metadata_ibfk_1'],
+
               [[instance_type_projects.c.instance_type_id],
                   [instance_types.c.id],
                   'instance_type_projects_ibfk_1'],
@@ -1497,35 +1494,65 @@ def upgrade(migrate_engine):
               [[reservations.c.usage_id],
                   [quota_usages.c.id],
                   'reservations_ibfk_1'],
-              [[security_group_instance_association.c.instance_uuid],
-                  [instances.c.uuid],
-                  'security_group_instance_association_instance_uuid_fkey'],
               [[security_group_instance_association.c.security_group_id],
                   [security_groups.c.id],
                   'security_group_instance_association_ibfk_1'],
-              [[virtual_interfaces.c.instance_uuid],
-                  [instances.c.uuid],
-                  'virtual_interfaces_instance_uuid_fkey'],
               [[compute_node_stats.c.compute_node_id],
                   [compute_nodes.c.id],
                   'fk_compute_node_stats_compute_node_id'],
               [[compute_nodes.c.service_id],
                   [services.c.id],
                   'fk_compute_nodes_service_id'],
-              [[instance_actions.c.instance_uuid],
-                  [instances.c.uuid],
-                  'fk_instance_actions_instance_uuid'],
-              [[instance_faults.c.instance_uuid],
-                  [instances.c.uuid],
-                  'fk_instance_faults_instance_uuid'],
-              [[migrations.c.instance_uuid],
-                  [instances.c.uuid],
-                  'fk_migrations_instance_uuid'],
+
             ]
 
+    # NOTE(mriedem): DB2 doesn't support unique constraints on columns that
+    # are nullable so we can only create foreign keys on unique constraints
+    # that actually exist, which excludes any FK on instances.uuid.
+    if migrate_engine.name != 'ibm_db_sa':
+
+        secgroup_instance_association_instance_uuid_fkey = (
+                    'security_group_instance_association_instance_uuid_fkey')
+        fkeys.extend(
+                [
+
+                  [[fixed_ips.c.instance_uuid],
+                      [instances.c.uuid],
+                      'fixed_ips_instance_uuid_fkey'],
+                  [[block_device_mapping.c.instance_uuid],
+                      [instances.c.uuid],
+                      'block_device_mapping_instance_uuid_fkey'],
+                  [[instance_info_caches.c.instance_uuid],
+                      [instances.c.uuid],
+                      'instance_info_caches_instance_uuid_fkey'],
+                  [[instance_metadata.c.instance_uuid],
+                      [instances.c.uuid],
+                      'instance_metadata_instance_uuid_fkey'],
+                  [[instance_system_metadata.c.instance_uuid],
+                      [instances.c.uuid],
+                      'instance_system_metadata_ibfk_1'],
+                  [[security_group_instance_association.c.instance_uuid],
+                      [instances.c.uuid],
+                      secgroup_instance_association_instance_uuid_fkey],
+                  [[virtual_interfaces.c.instance_uuid],
+                      [instances.c.uuid],
+                      'virtual_interfaces_instance_uuid_fkey'],
+                  [[instance_actions.c.instance_uuid],
+                      [instances.c.uuid],
+                      'fk_instance_actions_instance_uuid'],
+                  [[instance_faults.c.instance_uuid],
+                      [instances.c.uuid],
+                      'fk_instance_faults_instance_uuid'],
+                  [[migrations.c.instance_uuid],
+                      [instances.c.uuid],
+                      'fk_migrations_instance_uuid']
+
+                ])
+
     for fkey_pair in fkeys:
-        if migrate_engine.name == 'mysql':
-            # For MySQL we name our fkeys explicitly so they match Havana
+        if migrate_engine.name in ('mysql', 'ibm_db_sa'):
+            # For MySQL and DB2 we name our fkeys explicitly
+            # so they match Havana
             fkey = ForeignKeyConstraint(columns=fkey_pair[0],
                                    refcolumns=fkey_pair[1],
                                    name=fkey_pair[2])
@@ -1536,13 +1563,14 @@ def upgrade(migrate_engine):
                                    refcolumns=fkey_pair[1])
             fkey.create()
 
-    if migrate_engine.name == "mysql":
+    if migrate_engine.name == 'mysql':
         # In Folsom we explicitly converted migrate_version to UTF8.
-        sql = "ALTER TABLE migrate_version CONVERT TO CHARACTER SET utf8;"
+        migrate_engine.execute(
+            'ALTER TABLE migrate_version CONVERT TO CHARACTER SET utf8')
         # Set default DB charset to UTF8.
-        sql += "ALTER DATABASE %s DEFAULT CHARACTER SET utf8;" % \
-                migrate_engine.url.database
-        migrate_engine.execute(sql)
+        migrate_engine.execute(
+            'ALTER DATABASE %s DEFAULT CHARACTER SET utf8' %
+            migrate_engine.url.database)
 
     _create_shadow_tables(migrate_engine)
 
@@ -1550,7 +1578,3 @@ def upgrade(migrate_engine):
     _populate_instance_types(instance_types)
 
     _create_dump_tables(migrate_engine)
-
-
-def downgrade(migrate_engine):
-    raise NotImplementedError('Downgrade from Havana is unsupported.')

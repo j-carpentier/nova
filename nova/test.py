@@ -20,106 +20,56 @@ Allows overriding of flags for use of fakes, and some black magic for
 inline callbacks.
 
 """
+import contextlib
 
+import datetime
 import eventlet
 eventlet.monkey_patch(os=False)
 
 import copy
-import gettext
-import logging
+import inspect
+import logging as std_logging
+import mock
 import os
-import shutil
-import sys
-import uuid
 
 import fixtures
-from oslo.config import cfg
-from oslo.messaging import conffixture as messaging_conffixture
+from oslo_concurrency import lockutils
+from oslo_config import cfg
+from oslo_config import fixture as config_fixture
+from oslo_log.fixture import logging_error as log_fixture
+from oslo_log import log as logging
+from oslo_serialization import jsonutils
+from oslo_utils import timeutils
+from oslotest import moxstubout
+import six
 import testtools
 
 from nova import context
 from nova import db
-from nova.db import migration
-from nova.db.sqlalchemy import api as session
 from nova.network import manager as network_manager
-from nova import objects
 from nova.objects import base as objects_base
-from nova.openstack.common.fixture import logging as log_fixture
-from nova.openstack.common.fixture import moxstubout
-from nova.openstack.common import log as nova_logging
-from nova.openstack.common import timeutils
-from nova import paths
-from nova import rpc
-from nova import service
-from nova.tests import conf_fixture
-from nova.tests import policy_fixture
+from nova.tests import fixtures as nova_fixtures
+from nova.tests.unit import conf_fixture
+from nova.tests.unit import policy_fixture
 from nova import utils
 
 
-test_opts = [
-    cfg.StrOpt('sqlite_clean_db',
-               default='clean.sqlite',
-               help='File name of clean sqlite db'),
-    ]
-
 CONF = cfg.CONF
-CONF.register_opts(test_opts)
-CONF.import_opt('connection',
-                'nova.openstack.common.db.options',
-                group='database')
-CONF.import_opt('sqlite_db', 'nova.openstack.common.db.options',
-                group='database')
-CONF.import_opt('enabled', 'nova.api.openstack', group='osapi_v3')
+CONF.import_opt('enabled', 'nova.api.openstack', group='osapi_v21')
+
+logging.register_options(CONF)
 CONF.set_override('use_stderr', False)
+logging.setup(CONF, 'nova')
 
-nova_logging.setup('nova')
-
-# NOTE(comstud): Make sure we have all of the objects loaded. We do this
-# at module import time, because we may be using mock decorators in our
-# tests that run at import time.
-objects.register_all()
-
-_DB_CACHE = None
 _TRUE_VALUES = ('True', 'true', '1', 'yes')
 
-
-class Database(fixtures.Fixture):
-
-    def __init__(self, db_session, db_migrate, sql_connection,
-                    sqlite_db, sqlite_clean_db):
-        self.sql_connection = sql_connection
-        self.sqlite_db = sqlite_db
-        self.sqlite_clean_db = sqlite_clean_db
-
-        self.engine = db_session.get_engine()
-        self.engine.dispose()
-        conn = self.engine.connect()
-        if sql_connection == "sqlite://":
-            if db_migrate.db_version() > db_migrate.db_initial_version():
-                return
-        else:
-            testdb = paths.state_path_rel(sqlite_db)
-            if os.path.exists(testdb):
-                return
-        db_migrate.db_sync()
-        if sql_connection == "sqlite://":
-            conn = self.engine.connect()
-            self._DB = "".join(line for line in conn.connection.iterdump())
-            self.engine.dispose()
-        else:
-            cleandb = paths.state_path_rel(sqlite_clean_db)
-            shutil.copyfile(testdb, cleandb)
-
-    def setUp(self):
-        super(Database, self).setUp()
-
-        if self.sql_connection == "sqlite://":
-            conn = self.engine.connect()
-            conn.connection.executescript(self._DB)
-            self.addCleanup(self.engine.dispose)
-        else:
-            shutil.copyfile(paths.state_path_rel(self.sqlite_clean_db),
-                            paths.state_path_rel(self.sqlite_db))
+if six.PY3:
+    @contextlib.contextmanager
+    def nested(*contexts):
+        with contextlib.ExitStack() as stack:
+            yield [stack.enter_context(c) for c in contexts]
+else:
+    nested = contextlib.nested
 
 
 class SampleNetworks(fixtures.Fixture):
@@ -152,56 +102,11 @@ class SampleNetworks(fixtures.Fixture):
             network.set_network_host(ctxt, net)
 
 
-class ReplaceModule(fixtures.Fixture):
-    """Replace a module with a fake module."""
-
-    def __init__(self, name, new_value):
-        self.name = name
-        self.new_value = new_value
-
-    def _restore(self, old_value):
-        sys.modules[self.name] = old_value
-
-    def setUp(self):
-        super(ReplaceModule, self).setUp()
-        old_value = sys.modules.get(self.name)
-        sys.modules[self.name] = self.new_value
-        self.addCleanup(self._restore, old_value)
-
-
-class ServiceFixture(fixtures.Fixture):
-    """Run a service as a test fixture."""
-
-    def __init__(self, name, host=None, **kwargs):
-        name = name
-        host = host and host or uuid.uuid4().hex
-        kwargs.setdefault('host', host)
-        kwargs.setdefault('binary', 'nova-%s' % name)
-        self.kwargs = kwargs
-
-    def setUp(self):
-        super(ServiceFixture, self).setUp()
-        self.service = service.Service.create(**self.kwargs)
-        self.service.start()
-        self.addCleanup(self.service.kill)
-
-
-class TranslationFixture(fixtures.Fixture):
-    """Use gettext NullTranslation objects in tests."""
-
-    def setUp(self):
-        super(TranslationFixture, self).setUp()
-        nulltrans = gettext.NullTranslations()
-        gettext_fixture = fixtures.MonkeyPatch('gettext.translation',
-                                               lambda *x, **y: nulltrans)
-        self.gettext_patcher = self.useFixture(gettext_fixture)
-
-
 class TestingException(Exception):
     pass
 
 
-class NullHandler(logging.Handler):
+class NullHandler(std_logging.Handler):
     """custom default NullHandler to attempt to format the record.
 
     Used in conjunction with
@@ -218,6 +123,61 @@ class NullHandler(logging.Handler):
         self.lock = None
 
 
+class skipIf(object):
+    def __init__(self, condition, reason):
+        self.condition = condition
+        self.reason = reason
+
+    def __call__(self, func_or_cls):
+        condition = self.condition
+        reason = self.reason
+        if inspect.isfunction(func_or_cls):
+            @six.wraps(func_or_cls)
+            def wrapped(*args, **kwargs):
+                if condition:
+                    raise testtools.TestCase.skipException(reason)
+                return func_or_cls(*args, **kwargs)
+
+            return wrapped
+        elif inspect.isclass(func_or_cls):
+            orig_func = getattr(func_or_cls, 'setUp')
+
+            @six.wraps(orig_func)
+            def new_func(self, *args, **kwargs):
+                if condition:
+                    raise testtools.TestCase.skipException(reason)
+                orig_func(self, *args, **kwargs)
+
+            func_or_cls.setUp = new_func
+            return func_or_cls
+        else:
+            raise TypeError('skipUnless can be used only with functions or '
+                            'classes')
+
+
+def _patch_mock_to_raise_for_invalid_assert_calls():
+    def raise_for_invalid_assert_calls(wrapped):
+        def wrapper(_self, name):
+            valid_asserts = [
+                'assert_called_with',
+                'assert_called_once_with',
+                'assert_has_calls',
+                'assert_any_calls']
+
+            if name.startswith('assert') and name not in valid_asserts:
+                raise AttributeError('%s is not a valid mock assert method'
+                                     % name)
+
+            return wrapped(_self, name)
+        return wrapper
+    mock.Mock.__getattr__ = raise_for_invalid_assert_calls(
+        mock.Mock.__getattr__)
+
+# NOTE(gibi): needs to be called only once at import time
+# to patch the mock lib
+_patch_mock_to_raise_for_invalid_assert_calls()
+
+
 class TestCase(testtools.TestCase):
     """Test case base class for all unit tests.
 
@@ -225,91 +185,59 @@ class TestCase(testtools.TestCase):
     `NoDBTestCase` first.
     """
     USES_DB = True
+    REQUIRES_LOCKING = False
 
-    # NOTE(rpodolyaka): this attribute can be overridden in subclasses in order
-    #                   to scale the global test timeout value set for each
-    #                   test case separately. Use 0 value to disable timeout.
     TIMEOUT_SCALING_FACTOR = 1
 
     def setUp(self):
         """Run before each test method to initialize test environment."""
         super(TestCase, self).setUp()
-        test_timeout = os.environ.get('OS_TEST_TIMEOUT', 0)
-        try:
-            test_timeout = int(test_timeout)
-        except ValueError:
-            # If timeout value is invalid do not set a timeout.
-            test_timeout = 0
+        self.useFixture(nova_fixtures.Timeout(
+            os.environ.get('OS_TEST_TIMEOUT', 0),
+            self.TIMEOUT_SCALING_FACTOR))
 
-        if self.TIMEOUT_SCALING_FACTOR >= 0:
-            test_timeout *= self.TIMEOUT_SCALING_FACTOR
-        else:
-            raise ValueError('TIMEOUT_SCALING_FACTOR value must be >= 0')
-
-        if test_timeout > 0:
-            self.useFixture(fixtures.Timeout(test_timeout, gentle=True))
         self.useFixture(fixtures.NestedTempfile())
         self.useFixture(fixtures.TempHomeDir())
-        self.useFixture(TranslationFixture())
         self.useFixture(log_fixture.get_logging_handle_error_fixture())
 
-        if os.environ.get('OS_STDOUT_CAPTURE') in _TRUE_VALUES:
-            stdout = self.useFixture(fixtures.StringStream('stdout')).stream
-            self.useFixture(fixtures.MonkeyPatch('sys.stdout', stdout))
-        if os.environ.get('OS_STDERR_CAPTURE') in _TRUE_VALUES:
-            stderr = self.useFixture(fixtures.StringStream('stderr')).stream
-            self.useFixture(fixtures.MonkeyPatch('sys.stderr', stderr))
+        self.useFixture(nova_fixtures.OutputStreamCapture())
 
-        rpc.add_extra_exmods('nova.test')
-        self.addCleanup(rpc.clear_extra_exmods)
-        self.addCleanup(rpc.cleanup)
+        self.useFixture(nova_fixtures.StandardLogging())
 
-        # set root logger to debug
-        root = logging.getLogger()
-        root.setLevel(logging.DEBUG)
-
-        # supports collecting debug level for local runs
-        if os.environ.get('OS_DEBUG') in _TRUE_VALUES:
-            level = logging.DEBUG
-        else:
-            level = logging.INFO
-
-        # Collect logs
-        fs = '%(levelname)s [%(name)s] %(message)s'
-        self.useFixture(fixtures.FakeLogger(format=fs, level=None))
-        root.handlers[0].setLevel(level)
-
-        if level > logging.DEBUG:
-            # Just attempt to format debug level logs, but don't save them
-            handler = NullHandler()
-            self.useFixture(fixtures.LogHandler(handler, nuke_handlers=False))
-            handler.setLevel(logging.DEBUG)
+        # NOTE(sdague): because of the way we were using the lock
+        # wrapper we eneded up with a lot of tests that started
+        # relying on global external locking being set up for them. We
+        # consider all of these to be *bugs*. Tests should not require
+        # global external locking, or if they do, they should
+        # explicitly set it up themselves.
+        #
+        # The following REQUIRES_LOCKING class parameter is provided
+        # as a bridge to get us there. No new tests should be added
+        # that require it, and existing classes and tests should be
+        # fixed to not need it.
+        if self.REQUIRES_LOCKING:
+            lock_path = self.useFixture(fixtures.TempDir()).path
+            self.fixture = self.useFixture(
+                config_fixture.Config(lockutils.CONF))
+            self.fixture.config(lock_path=lock_path,
+                                group='oslo_concurrency')
 
         self.useFixture(conf_fixture.ConfFixture(CONF))
-
-        self.messaging_conf = messaging_conffixture.ConfFixture(CONF)
-        self.messaging_conf.transport_driver = 'fake'
-        self.messaging_conf.response_timeout = 15
-        self.useFixture(self.messaging_conf)
-
-        rpc.init(CONF)
+        self.useFixture(nova_fixtures.RPCFixture('nova.test'))
 
         if self.USES_DB:
-            global _DB_CACHE
-            if not _DB_CACHE:
-                _DB_CACHE = Database(session, migration,
-                        sql_connection=CONF.database.connection,
-                        sqlite_db=CONF.database.sqlite_db,
-                        sqlite_clean_db=CONF.sqlite_clean_db)
+            self.useFixture(nova_fixtures.Database())
 
-            self.useFixture(_DB_CACHE)
+        # NOTE(blk-u): WarningsFixture must be after the Database fixture
+        # because sqlalchemy-migrate messes with the warnings filters.
+        self.useFixture(nova_fixtures.WarningsFixture())
 
         # NOTE(danms): Make sure to reset us back to non-remote objects
         # for each test to avoid interactions. Also, backup the object
         # registry.
         objects_base.NovaObject.indirection_api = None
         self._base_test_obj_backup = copy.copy(
-            objects_base.NovaObject._obj_classes)
+            objects_base.NovaObjectRegistry._registry._obj_classes)
         self.addCleanup(self._restore_obj_registry)
 
         # NOTE(mnaser): All calls to utils.is_neutron() are cached in
@@ -323,29 +251,132 @@ class TestCase(testtools.TestCase):
         self.addCleanup(self._clear_attrs)
         self.useFixture(fixtures.EnvironmentVariable('http_proxy'))
         self.policy = self.useFixture(policy_fixture.PolicyFixture())
-        CONF.set_override('fatal_exception_format_errors', True)
-        CONF.set_override('enabled', True, 'osapi_v3')
-        CONF.set_override('force_dhcp_release', False)
+
+        self.useFixture(nova_fixtures.PoisonFunctions())
 
     def _restore_obj_registry(self):
-        objects_base.NovaObject._obj_classes = self._base_test_obj_backup
+        objects_base.NovaObjectRegistry._registry._obj_classes = \
+                self._base_test_obj_backup
 
     def _clear_attrs(self):
         # Delete attributes that don't start with _ so they don't pin
         # memory around unnecessarily for the duration of the test
         # suite
         for key in [k for k in self.__dict__.keys() if k[0] != '_']:
-            del self.__dict__[key]
+            # NOTE(gmann): Skip attribute 'id' because if tests are being
+            # generated using testscenarios then, 'id' attribute is being
+            # added during cloning the tests. And later that 'id' attribute
+            # is being used by test suite to generate the results for each
+            # newly generated tests by testscenarios.
+            if key != 'id':
+                del self.__dict__[key]
 
     def flags(self, **kw):
         """Override flag variables for a test."""
         group = kw.pop('group', None)
-        for k, v in kw.iteritems():
+        for k, v in six.iteritems(kw):
             CONF.set_override(k, v, group)
 
     def start_service(self, name, host=None, **kwargs):
-        svc = self.useFixture(ServiceFixture(name, host, **kwargs))
+        svc = self.useFixture(
+            nova_fixtures.ServiceFixture(name, host, **kwargs))
         return svc.service
+
+    def assertJsonEqual(self, expected, observed):
+        """Asserts that 2 complex data structures are json equivalent.
+
+        We use data structures which serialize down to json throughout
+        the code, and often times we just need to know that these are
+        json equivalent. This means that list order is not important,
+        and should be sorted.
+
+        Because this is a recursive set of assertions, when failure
+        happens we want to expose both the local failure and the
+        global view of the 2 data structures being compared. So a
+        MismatchError which includes the inner failure as the
+        mismatch, and the passed in expected / observed as matchee /
+        matcher.
+
+        """
+        if isinstance(expected, six.string_types):
+            expected = jsonutils.loads(expected)
+        if isinstance(observed, six.string_types):
+            observed = jsonutils.loads(observed)
+
+        def sort_key(x):
+            if isinstance(x, (set, list)) or isinstance(x, datetime.datetime):
+                return str(x)
+            if isinstance(x, dict):
+                items = ((sort_key(key), sort_key(value))
+                         for key, value in x.items())
+                return sorted(items)
+            return x
+
+        def inner(expected, observed):
+            if isinstance(expected, dict) and isinstance(observed, dict):
+                self.assertEqual(len(expected), len(observed))
+                expected_keys = sorted(expected)
+                observed_keys = sorted(observed)
+                self.assertEqual(expected_keys, observed_keys)
+
+                for key in list(six.iterkeys(expected)):
+                    inner(expected[key], observed[key])
+            elif (isinstance(expected, (list, tuple, set)) and
+                      isinstance(observed, (list, tuple, set))):
+                self.assertEqual(len(expected), len(observed))
+
+                expected_values_iter = iter(sorted(expected, key=sort_key))
+                observed_values_iter = iter(sorted(observed, key=sort_key))
+
+                for i in range(len(expected)):
+                    inner(next(expected_values_iter),
+                          next(observed_values_iter))
+            else:
+                self.assertEqual(expected, observed)
+
+        try:
+            inner(expected, observed)
+        except testtools.matchers.MismatchError as e:
+            inner_mismatch = e.mismatch
+            # inverting the observed / expected because testtools
+            # error messages assume expected is second. Possibly makes
+            # reading the error messages less confusing.
+            raise testtools.matchers.MismatchError(observed, expected,
+                                          inner_mismatch, verbose=True)
+
+    def assertPublicAPISignatures(self, baseinst, inst):
+        def get_public_apis(inst):
+            methods = {}
+
+            def findmethods(object):
+                return inspect.ismethod(object) or inspect.isfunction(object)
+
+            for (name, value) in inspect.getmembers(inst, findmethods):
+                if name.startswith("_"):
+                    continue
+                methods[name] = value
+            return methods
+
+        baseclass = baseinst.__class__.__name__
+        basemethods = get_public_apis(baseinst)
+        implmethods = get_public_apis(inst)
+
+        extranames = []
+        for name in sorted(implmethods.keys()):
+            if name not in basemethods:
+                extranames.append(name)
+
+        self.assertEqual([], extranames,
+                         "public APIs not listed in base class %s" %
+                         baseclass)
+
+        for name in sorted(implmethods.keys()):
+            baseargs = inspect.getargspec(basemethods[name])
+            implargs = inspect.getargspec(implmethods[name])
+
+            self.assertEqual(baseargs, implargs,
+                             "%s args don't match base class %s" %
+                             (name, baseclass))
 
 
 class APICoverage(object):
@@ -384,3 +415,35 @@ class BaseHookTestCase(NoDBTestCase):
     def assert_has_hook(self, expected_name, func):
         self.assertTrue(hasattr(func, '__hook_name__'))
         self.assertEqual(expected_name, func.__hook_name__)
+
+
+class MatchType(object):
+    """Matches any instance of a specified type
+
+    The MatchType class is a helper for use with the
+    mock.assert_called_with() method that lets you
+    assert that a particular parameter has a specific
+    data type. It enables strict check than the built
+    in mock.ANY helper, and is the equivalent of the
+    mox.IsA() function from the legacy mox library
+
+    Example usage could be:
+
+      mock_some_method.assert_called_once_with(
+            "hello",
+            MatchType(objects.Instance),
+            mock.ANY,
+            "world",
+            MatchType(objects.KeyPair))
+    """
+    def __init__(self, wanttype):
+        self.wanttype = wanttype
+
+    def __eq__(self, other):
+        return type(other) == self.wanttype
+
+    def __ne__(self, other):
+        return type(other) != self.wanttype
+
+    def __repr__(self):
+        return "<MatchType:" + str(self.wanttype) + ">"

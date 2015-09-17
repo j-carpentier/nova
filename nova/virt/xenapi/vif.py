@@ -17,9 +17,9 @@
 
 """VIF drivers for XenAPI."""
 
-from oslo.config import cfg
+from oslo_config import cfg
 
-from nova.openstack.common.gettextutils import _
+from nova.i18n import _
 from nova.virt.xenapi import network_utils
 from nova.virt.xenapi import vm_utils
 
@@ -94,7 +94,7 @@ class XenAPIBridgeDriver(XenVIFDriver):
                     bridge_interface)
             pifs = self._session.call_xenapi('PIF.get_all_records_where',
                                              expr)
-            pif_ref = None
+
             # Multiple PIF are ok: we are dealing with a pool
             if len(pifs) == 0:
                 raise Exception(_('Found no PIF for device %s') %

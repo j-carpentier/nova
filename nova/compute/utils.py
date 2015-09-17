@@ -15,24 +15,23 @@
 """Compute-related Utilities and helpers."""
 
 import itertools
-import re
 import string
 import traceback
 
-from oslo.config import cfg
+import netifaces
+from oslo_config import cfg
+from oslo_log import log
+import six
 
 from nova import block_device
 from nova.compute import flavors
 from nova.compute import power_state
 from nova.compute import task_states
 from nova import exception
+from nova.i18n import _LW
 from nova.network import model as network_model
 from nova import notifications
-from nova.objects import base as obj_base
-from nova.objects import instance_action as instance_action_obj
-from nova.objects import instance_fault as instance_fault_obj
-from nova.openstack.common.gettextutils import _
-from nova.openstack.common import log
+from nova import objects
 from nova import rpc
 from nova import utils
 from nova.virt import driver
@@ -44,7 +43,7 @@ LOG = log.getLogger(__name__)
 
 def exception_to_dict(fault):
     """Converts exceptions to a dict for use in notifications."""
-    #TODO(johngarbutt) move to nova/exception.py to share with wrap_exception
+    # TODO(johngarbutt) move to nova/exception.py to share with wrap_exception
 
     code = 500
     if hasattr(fault, "kwargs"):
@@ -58,7 +57,7 @@ def exception_to_dict(fault):
     # just because there is an unexpected error retrieving the message
     except Exception:
         try:
-            message = unicode(fault)
+            message = six.text_type(fault)
         except Exception:
             message = None
     if not message:
@@ -66,8 +65,7 @@ def exception_to_dict(fault):
     # NOTE(dripton) The message field in the database is limited to 255 chars.
     # MySQL silently truncates overly long messages, but PostgreSQL throws an
     # error if we don't truncate it.
-    u_message = unicode(message)[:255]
-
+    u_message = utils.safe_truncate(message, 255)
     fault_dict = dict(exception=fault)
     fault_dict["message"] = u_message
     fault_dict["code"] = code
@@ -80,22 +78,22 @@ def _get_fault_details(exc_info, error_code):
         tb = exc_info[2]
         if tb:
             details = ''.join(traceback.format_tb(tb))
-    return unicode(details)
+    return six.text_type(details)
 
 
 def add_instance_fault_from_exc(context, instance, fault, exc_info=None):
     """Adds the specified fault to the database."""
 
-    fault_obj = instance_fault_obj.InstanceFault(context=context)
+    fault_obj = objects.InstanceFault(context=context)
     fault_obj.host = CONF.host
-    fault_obj.instance_uuid = instance['uuid']
+    fault_obj.instance_uuid = instance.uuid
     fault_obj.update(exception_to_dict(fault))
     code = fault_obj.code
     fault_obj.details = _get_fault_details(exc_info, code)
     fault_obj.create()
 
 
-def get_device_name_for_instance(context, instance, bdms, device):
+def get_device_name_for_instance(instance, bdms, device):
     """Validates (or generates) a device name for instance.
 
     This method is a wrapper for get_next_device_name that gets the list
@@ -137,6 +135,8 @@ def get_next_device_name(instance, device_name_list,
     /dev/vdc is specified but the backend uses /dev/xvdc), the device
     name will be converted to the appropriate format.
     """
+    is_xen = driver.compute_driver_matches('xenapi.XenAPIDriver')
+
     req_prefix = None
     req_letter = None
 
@@ -150,12 +150,13 @@ def get_next_device_name(instance, device_name_list,
         root_device_name = block_device.DEFAULT_ROOT_DEV_NAME
 
     try:
-        prefix = block_device.match_device(root_device_name)[0]
+        prefix = block_device.match_device(
+                block_device.prepend_dev(root_device_name))[0]
     except (TypeError, AttributeError, ValueError):
         raise exception.InvalidDevicePath(path=root_device_name)
 
     # NOTE(vish): remove this when xenapi is setting default_root_device
-    if driver.compute_driver_matches('xenapi.XenAPIDriver'):
+    if is_xen:
         prefix = '/dev/xvd'
 
     if req_prefix != prefix:
@@ -164,20 +165,17 @@ def get_next_device_name(instance, device_name_list,
 
     used_letters = set()
     for device_path in device_name_list:
-        letter = block_device.strip_prefix(device_path)
-        # NOTE(vish): delete numbers in case we have something like
-        #             /dev/sda1
-        letter = re.sub("\d+", "", letter)
+        letter = block_device.get_device_letter(device_path)
         used_letters.add(letter)
 
     # NOTE(vish): remove this when xenapi is properly setting
     #             default_ephemeral_device and default_swap_device
-    if driver.compute_driver_matches('xenapi.XenAPIDriver'):
-        flavor = flavors.extract_flavor(instance)
-        if flavor['ephemeral_gb']:
+    if is_xen:
+        flavor = instance.get_flavor()
+        if flavor.ephemeral_gb:
             used_letters.add('b')
 
-        if flavor['swap']:
+        if flavor.swap:
             used_letters.add('c')
 
     if not req_letter:
@@ -199,29 +197,23 @@ def _get_unused_letter(used_letters):
     return letters[0]
 
 
-def get_image_metadata(context, image_api, image_id_or_uri, instance):
-    # If the base image is still available, get its metadata
+def get_value_from_system_metadata(instance, key, type, default):
+    """Get a value of a specified type from image metadata.
+
+    @param instance: The instance object
+    @param key: The name of the property to get
+    @param type: The python type the value is be returned as
+    @param default: The value to return if key is not set or not the right type
+    """
+    value = instance.system_metadata.get(key, default)
     try:
-        image = image_api.get(context, image_id_or_uri)
-    except (exception.ImageNotAuthorized,
-            exception.ImageNotFound,
-            exception.Invalid) as e:
-        LOG.warning(_("Can't access image %(image_id)s: %(error)s"),
-                    {"image_id": image_id_or_uri, "error": e},
-                    instance=instance)
-        image_system_meta = {}
-    else:
-        flavor = flavors.extract_flavor(instance)
-        image_system_meta = utils.get_system_metadata_from_image(image, flavor)
-
-    # Get the system metadata from the instance
-    system_meta = utils.instance_sys_meta(instance)
-
-    # Merge the metadata from the instance with the image's, if any
-    system_meta.update(image_system_meta)
-
-    # Convert the system metadata to image metadata
-    return utils.get_image_from_system_metadata(system_meta)
+        return type(value)
+    except ValueError:
+        LOG.warning(_LW("Metadata value %(value)s for %(key)s is not of "
+                        "type %(type)s. Using default value %(default)s."),
+                    {'value': value, 'key': key, 'type': type,
+                     'default': default}, instance=instance)
+        return default
 
 
 def notify_usage_exists(notifier, context, instance_ref, current_period=False,
@@ -300,6 +292,17 @@ def notify_about_instance_usage(notifier, context, instance, event_suffix,
     method(context, 'compute.instance.%s' % event_suffix, usage_info)
 
 
+def notify_about_server_group_update(context, event_suffix, sg_payload):
+    """Send a notification about server group update.
+
+    :param event_suffix: Event type like "create.start" or "create.end"
+    :param sg_payload: payload for server group update
+    """
+    notifier = rpc.get_notifier(service='servergroup')
+
+    notifier.info(context, 'servergroup.%s' % event_suffix, sg_payload)
+
+
 def notify_about_aggregate_update(context, event_suffix, aggregate_payload):
     """Send a notification about aggregate update.
 
@@ -330,8 +333,8 @@ def notify_about_host_update(context, event_suffix, host_payload):
     """
     host_identifier = host_payload.get('host_name')
     if not host_identifier:
-        LOG.warn(_("No host name specified for the notification of "
-                   "HostAPI.%s and it will be ignored"), event_suffix)
+        LOG.warning(_LW("No host name specified for the notification of "
+                        "HostAPI.%s and it will be ignored"), event_suffix)
         return
 
     notifier = rpc.get_notifier(service='api', host=host_identifier)
@@ -340,47 +343,26 @@ def notify_about_host_update(context, event_suffix, host_payload):
 
 
 def get_nw_info_for_instance(instance):
-    if isinstance(instance, obj_base.NovaObject):
-        if instance.info_cache is None:
-            return network_model.NetworkInfo.hydrate([])
-        return instance.info_cache.network_info
-    # FIXME(comstud): Transitional while we convert to objects.
-    info_cache = instance['info_cache'] or {}
-    nw_info = info_cache.get('network_info') or []
-    if not isinstance(nw_info, network_model.NetworkInfo):
-        nw_info = network_model.NetworkInfo.hydrate(nw_info)
-    return nw_info
+    if instance.info_cache is None:
+        return network_model.NetworkInfo.hydrate([])
+    return instance.info_cache.network_info
 
 
-def has_audit_been_run(context, conductor, host, timestamp=None):
-    begin, end = utils.last_completed_audit_period(before=timestamp)
-    task_log = conductor.task_log_get(context, "instance_usage_audit",
-                                      begin, end, host)
-    if task_log:
-        return True
-    else:
-        return False
+def refresh_info_cache_for_instance(context, instance):
+    """Refresh the info cache for an instance.
 
-
-def start_instance_usage_audit(context, conductor, begin, end, host,
-                               num_instances):
-    conductor.task_log_begin_task(context, "instance_usage_audit", begin,
-                                  end, host, num_instances,
-                                  "Instance usage audit started...")
-
-
-def finish_instance_usage_audit(context, conductor, begin, end, host, errors,
-                                message):
-    conductor.task_log_end_task(context, "instance_usage_audit", begin, end,
-                                host, errors, message)
+    :param instance: The instance object.
+    """
+    if instance.info_cache is not None:
+        instance.info_cache.refresh()
 
 
 def usage_volume_info(vol_usage):
     def null_safe_str(s):
         return str(s) if s else ''
 
-    tot_refreshed = vol_usage['tot_last_refreshed']
-    curr_refreshed = vol_usage['curr_last_refreshed']
+    tot_refreshed = vol_usage.tot_last_refreshed
+    curr_refreshed = vol_usage.curr_last_refreshed
     if tot_refreshed and curr_refreshed:
         last_refreshed_time = max(tot_refreshed, curr_refreshed)
     elif tot_refreshed:
@@ -390,18 +372,18 @@ def usage_volume_info(vol_usage):
         last_refreshed_time = curr_refreshed
 
     usage_info = dict(
-          volume_id=vol_usage['volume_id'],
-          tenant_id=vol_usage['project_id'],
-          user_id=vol_usage['user_id'],
-          availability_zone=vol_usage['availability_zone'],
-          instance_id=vol_usage['instance_uuid'],
+          volume_id=vol_usage.volume_id,
+          tenant_id=vol_usage.project_id,
+          user_id=vol_usage.user_id,
+          availability_zone=vol_usage.availability_zone,
+          instance_id=vol_usage.instance_uuid,
           last_refreshed=null_safe_str(last_refreshed_time),
-          reads=vol_usage['tot_reads'] + vol_usage['curr_reads'],
-          read_bytes=vol_usage['tot_read_bytes'] +
-                vol_usage['curr_read_bytes'],
-          writes=vol_usage['tot_writes'] + vol_usage['curr_writes'],
-          write_bytes=vol_usage['tot_write_bytes'] +
-                vol_usage['curr_write_bytes'])
+          reads=vol_usage.tot_reads + vol_usage.curr_reads,
+          read_bytes=vol_usage.tot_read_bytes +
+                vol_usage.curr_read_bytes,
+          writes=vol_usage.tot_writes + vol_usage.curr_writes,
+          write_bytes=vol_usage.tot_write_bytes +
+                vol_usage.curr_write_bytes)
 
     return usage_info
 
@@ -416,6 +398,131 @@ def get_reboot_type(task_state, current_power_state):
     return reboot_type
 
 
+def get_machine_ips():
+    """Get the machine's ip addresses
+
+    :returns: list of Strings of ip addresses
+    """
+    addresses = []
+    for interface in netifaces.interfaces():
+        try:
+            iface_data = netifaces.ifaddresses(interface)
+            for family in iface_data:
+                if family not in (netifaces.AF_INET, netifaces.AF_INET6):
+                    continue
+                for address in iface_data[family]:
+                    addr = address['addr']
+
+                    # If we have an ipv6 address remove the
+                    # %ether_interface at the end
+                    if family == netifaces.AF_INET6:
+                        addr = addr.split('%')[0]
+                    addresses.append(addr)
+        except ValueError:
+            pass
+    return addresses
+
+
+def resize_quota_delta(context, new_flavor, old_flavor, sense, compare):
+    """Calculate any quota adjustment required at a particular point
+    in the resize cycle.
+
+    :param context: the request context
+    :param new_flavor: the target instance type
+    :param old_flavor: the original instance type
+    :param sense: the sense of the adjustment, 1 indicates a
+                  forward adjustment, whereas -1 indicates a
+                  reversal of a prior adjustment
+    :param compare: the direction of the comparison, 1 indicates
+                    we're checking for positive deltas, whereas
+                    -1 indicates negative deltas
+    """
+    def _quota_delta(resource):
+        return sense * (new_flavor[resource] - old_flavor[resource])
+
+    deltas = {}
+    if compare * _quota_delta('vcpus') > 0:
+        deltas['cores'] = _quota_delta('vcpus')
+    if compare * _quota_delta('memory_mb') > 0:
+        deltas['ram'] = _quota_delta('memory_mb')
+
+    return deltas
+
+
+def upsize_quota_delta(context, new_flavor, old_flavor):
+    """Calculate deltas required to adjust quota for an instance upsize.
+    """
+    return resize_quota_delta(context, new_flavor, old_flavor, 1, 1)
+
+
+def reverse_upsize_quota_delta(context, migration_ref):
+    """Calculate deltas required to reverse a prior upsizing
+    quota adjustment.
+    """
+    old_flavor = objects.Flavor.get_by_id(
+        context, migration_ref['old_instance_type_id'])
+    new_flavor = objects.Flavor.get_by_id(
+        context, migration_ref['new_instance_type_id'])
+
+    return resize_quota_delta(context, new_flavor, old_flavor, -1, -1)
+
+
+def downsize_quota_delta(context, instance):
+    """Calculate deltas required to adjust quota for an instance downsize.
+    """
+    old_flavor = instance.get_flavor('old')
+    new_flavor = instance.get_flavor('new')
+    return resize_quota_delta(context, new_flavor, old_flavor, 1, -1)
+
+
+def reserve_quota_delta(context, deltas, instance):
+    """If there are deltas to reserve, construct a Quotas object and
+    reserve the deltas for the given project.
+
+    :param context:    The nova request context.
+    :param deltas:     A dictionary of the proposed delta changes.
+    :param instance:   The instance we're operating on, so that
+                       quotas can use the correct project_id/user_id.
+    :return: nova.objects.quotas.Quotas
+    """
+    quotas = objects.Quotas(context=context)
+    if deltas:
+        project_id, user_id = objects.quotas.ids_from_instance(context,
+                                                               instance)
+        quotas.reserve(project_id=project_id, user_id=user_id,
+                       **deltas)
+    return quotas
+
+
+def get_inst_attrs_from_migration(migration, instance):
+    """Get the instance vcpus and memory_mb attributes.
+
+    Provides instance vcpus and memory_mb attributes according to
+    old flavor type using migration object if old flavor exists.
+    """
+    instance_vcpus = instance.vcpus
+    instance_memory_mb = instance.memory_mb
+
+    old_inst_type_id = migration.old_instance_type_id
+    try:
+        old_inst_type = flavors.get_flavor(old_inst_type_id)
+    except exception.FlavorNotFound:
+        LOG.warning(_LW("Flavor %d not found"), old_inst_type_id)
+    else:
+        instance_vcpus = old_inst_type.vcpus
+        vram_mb = old_inst_type.extra_specs.get('hw_video:ram_max_mb', 0)
+        instance_memory_mb = old_inst_type.memory_mb + vram_mb
+
+    return instance_vcpus, instance_memory_mb
+
+
+def remove_shelved_keys_from_system_metadata(instance):
+    # Delete system_metadata for a shelved instance
+    for key in ['shelved_at', 'shelved_image_id', 'shelved_host']:
+        if key in instance.system_metadata:
+            del (instance.system_metadata[key])
+
+
 class EventReporter(object):
     """Context manager to report instance action events."""
 
@@ -426,42 +533,26 @@ class EventReporter(object):
 
     def __enter__(self):
         for uuid in self.instance_uuids:
-            instance_action_obj.InstanceActionEvent.event_start(
+            objects.InstanceActionEvent.event_start(
                 self.context, uuid, self.event_name, want_result=False)
 
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         for uuid in self.instance_uuids:
-            instance_action_obj.InstanceActionEvent.event_finish_with_failure(
+            objects.InstanceActionEvent.event_finish_with_failure(
                 self.context, uuid, self.event_name, exc_val=exc_val,
                 exc_tb=exc_tb, want_result=False)
         return False
 
 
-def periodic_task_spacing_warn(config_option_name):
-    """Decorator to warn about an upcoming breaking change in methods which
-    use the @periodic_task decorator.
+class UnlimitedSemaphore(object):
+    def __enter__(self):
+        pass
 
-    Some methods using the @periodic_task decorator specify spacing=0 or
-    None to mean "do not call this method", but the decorator itself uses
-    0/None to mean "call at the default rate".
+    def __exit__(self):
+        pass
 
-    Starting with the K release the Nova methods will be changed to conform
-    to the Oslo decorator.  This decorator should be present wherever a
-    spacing value from user-supplied config is passed to @periodic_task, and
-    there is also a check to skip the method if the value is zero.  It will
-    log a warning if the spacing value from config is 0/None.
-    """
-    # TODO(gilliard) remove this decorator, its usages and the early returns
-    # near them after the K release.
-    def wrapper(f):
-        if (hasattr(f, "_periodic_spacing") and
-                (f._periodic_spacing == 0 or f._periodic_spacing is None)):
-            LOG.warning(_("Value of 0 or None specified for %s."
-                " This behaviour will change in meaning in the K release, to"
-                " mean 'call at the default rate' rather than 'do not call'."
-                " To keep the 'do not call' behaviour, use a negative value."),
-                config_option_name)
-        return f
-    return wrapper
+    @property
+    def balance(self):
+        return 0

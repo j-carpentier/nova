@@ -19,17 +19,17 @@
 import sys
 import traceback
 
-from oslo.config import cfg
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_reports import guru_meditation_report as gmr
 
 from nova.conductor import rpcapi as conductor_rpcapi
 from nova import config
 import nova.db.api
 from nova import exception
+from nova.i18n import _LE
 from nova import objects
 from nova.objects import base as objects_base
-from nova.openstack.common.gettextutils import _
-from nova.openstack.common import log as logging
-from nova.openstack.common.report import guru_meditation_report as gmr
 from nova import service
 from nova import utils
 from nova import version
@@ -47,7 +47,7 @@ def block_db_access():
         def __call__(self, *args, **kwargs):
             stacktrace = "".join(traceback.format_stack())
             LOG = logging.getLogger('nova.network')
-            LOG.error(_('No db access allowed in nova-network: %s'),
+            LOG.error(_LE('No db access allowed in nova-network: %s'),
                       stacktrace)
             raise exception.DBNotAllowed('nova-network')
 
@@ -56,7 +56,7 @@ def block_db_access():
 
 def main():
     config.parse_args(sys.argv)
-    logging.setup("nova")
+    logging.setup(CONF, "nova")
     utils.monkey_patch()
     objects.register_all()
 

@@ -15,9 +15,11 @@
 
 """Availability zone helper functions."""
 
-from oslo.config import cfg
+import collections
 
-from nova import db
+from oslo_config import cfg
+
+from nova import objects
 from nova.openstack.common import memorycache
 
 # NOTE(vish): azs don't change that often, so cache them for an hour to
@@ -61,11 +63,26 @@ def _make_cache_key(host):
     return "azcache-%s" % host.encode('utf-8')
 
 
+def _build_metadata_by_host(aggregates, hosts=None):
+    if hosts and not isinstance(hosts, set):
+        hosts = set(hosts)
+    metadata = collections.defaultdict(set)
+    for aggregate in aggregates:
+        for host in aggregate.hosts:
+            if hosts and host not in hosts:
+                continue
+            metadata[host].add(list(aggregate.metadata.values())[0])
+    return metadata
+
+
 def set_availability_zones(context, services):
     # Makes sure services isn't a sqlalchemy object
-    services = [dict(service.iteritems()) for service in services]
-    metadata = db.aggregate_host_get_by_metadata_key(context,
-            key='availability_zone')
+    services = [dict(service) for service in services]
+    hosts = set([service['host'] for service in services])
+    aggregates = objects.AggregateList.get_by_metadata_key(context,
+            'availability_zone', hosts=hosts)
+    metadata = _build_metadata_by_host(aggregates, hosts=hosts)
+    # gather all of the availability zones associated with a service host
     for service in services:
         az = CONF.internal_service_availability_zone
         if service['topic'] == "compute":
@@ -80,15 +97,11 @@ def set_availability_zones(context, services):
     return services
 
 
-def get_host_availability_zone(context, host, conductor_api=None):
-    if conductor_api:
-        metadata = conductor_api.aggregate_metadata_get_by_host(
-            context, host, key='availability_zone')
-    else:
-        metadata = db.aggregate_metadata_get_by_host(
-            context, host, key='availability_zone')
-    if 'availability_zone' in metadata:
-        az = list(metadata['availability_zone'])[0]
+def get_host_availability_zone(context, host):
+    aggregates = objects.AggregateList.get_by_host(context, host,
+                                                   key='availability_zone')
+    if aggregates:
+        az = aggregates[0].metadata['availability_zone']
     else:
         az = CONF.default_availability_zone
     return az
@@ -114,8 +127,8 @@ def get_availability_zones(context, get_only_available=False,
         :param with_hosts: whether to return hosts part of the AZs
         :type with_hosts: bool
     """
-    enabled_services = db.service_get_all(context, False)
-    enabled_services = set_availability_zones(context, enabled_services)
+    enabled_services = objects.ServiceList.get_all(context, disabled=False,
+                                                   set_zones=True)
 
     available_zones = []
     for (zone, host) in [(service['availability_zone'], service['host'])
@@ -130,8 +143,8 @@ def get_availability_zones(context, get_only_available=False,
             available_zones = list(_available_zones.items())
 
     if not get_only_available:
-        disabled_services = db.service_get_all(context, True)
-        disabled_services = set_availability_zones(context, disabled_services)
+        disabled_services = objects.ServiceList.get_all(context, disabled=True,
+                                                        set_zones=True)
         not_available_zones = []
         azs = available_zones if not with_hosts else dict(available_zones)
         zones = [(service['availability_zone'], service['host'])
@@ -154,13 +167,31 @@ def get_availability_zones(context, get_only_available=False,
 
 def get_instance_availability_zone(context, instance):
     """Return availability zone of specified instance."""
-    host = str(instance.get('host'))
+    host = instance.get('host')
     if not host:
-        return None
+        # Likely hasn't reached a viable compute node yet so give back the
+        # desired availability_zone in the instance record if the boot request
+        # specified one.
+        az = instance.get('availability_zone')
+        return az
 
     cache_key = _make_cache_key(host)
     cache = _get_cache()
     az = cache.get(cache_key)
+    az_inst = instance.get('availability_zone')
+    if az_inst is not None and az != az_inst:
+        # NOTE(sbauza): Cache is wrong, we need to invalidate it by fetching
+        # again the right AZ related to the aggregate the host belongs to.
+        # As the API is also calling this method for setting the instance
+        # AZ field, we don't need to update the instance.az field.
+        # This case can happen because the cache is populated before the
+        # instance has been assigned to the host so that it would keep the
+        # former reference which was incorrect. Instead of just taking the
+        # instance AZ information for refilling the cache, we prefer to
+        # invalidate the cache and fetch it again because there could be some
+        # corner cases where this method could be called before the instance
+        # has been assigned to the host also.
+        az = None
     if not az:
         elevated = context.elevated()
         az = get_host_availability_zone(elevated, host)

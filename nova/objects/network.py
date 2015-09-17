@@ -13,13 +13,15 @@
 #    under the License.
 
 import netaddr
-
-from oslo.config import cfg
+from oslo_config import cfg
 
 from nova import db
 from nova import exception
+from nova.i18n import _
+from nova import objects
 from nova.objects import base as obj_base
 from nova.objects import fields
+from nova import utils
 
 network_opts = [
     cfg.BoolOpt('share_dhcp_address',
@@ -30,14 +32,18 @@ network_opts = [
                      'for DHCP will be added on each nova-network node which '
                      'is only visible to the vms on the same host.'),
     cfg.IntOpt('network_device_mtu',
-               help='MTU setting for network interface'),
+               help='DEPRECATED: THIS VALUE SHOULD BE SET WHEN CREATING THE '
+                    'NETWORK. MTU setting for network interface.'),
 ]
 
 CONF = cfg.CONF
 CONF.register_opts(network_opts)
 
 
-class Network(obj_base.NovaPersistentObject, obj_base.NovaObject):
+# TODO(berrange): Remove NovaObjectDictCompat
+@obj_base.NovaObjectRegistry.register
+class Network(obj_base.NovaPersistentObject, obj_base.NovaObject,
+              obj_base.NovaObjectDictCompat):
     # Version 1.0: Initial version
     # Version 1.1: Added in_use_on_host()
     # Version 1.2: Added mtu, dhcp_server, enable_dhcp, share_address
@@ -92,11 +98,11 @@ class Network(obj_base.NovaPersistentObject, obj_base.NovaObject):
         try:
             return netaddr.IPNetwork(netmask).netmask
         except netaddr.AddrFormatError:
-            raise ValueError('IPv6 netmask "%s" must be a netmask '
-                             'or integral prefix' % netmask)
+            raise ValueError(_('IPv6 netmask "%s" must be a netmask '
+                               'or integral prefix') % netmask)
 
     def obj_make_compatible(self, primitive, target_version):
-        target_version = tuple(int(x) for x in target_version.split('.'))
+        target_version = utils.convert_version_to_tuple(target_version)
         if target_version < (1, 2):
             if 'mtu' in primitive:
                 del primitive['mtu']
@@ -164,22 +170,23 @@ class Network(obj_base.NovaPersistentObject, obj_base.NovaObject):
         return changes
 
     @obj_base.remotable
-    def create(self, context):
+    def create(self):
         updates = self._get_primitive_changes()
         if 'id' in updates:
             raise exception.ObjectActionError(action='create',
                                               reason='already created')
-        db_network = db.network_create_safe(context, updates)
-        self._from_db_object(context, self, db_network)
+        db_network = db.network_create_safe(self._context, updates)
+        self._from_db_object(self._context, self, db_network)
 
     @obj_base.remotable
-    def destroy(self, context):
-        db.network_delete_safe(context, self.id)
+    def destroy(self):
+        db.network_delete_safe(self._context, self.id)
         self.deleted = True
         self.obj_reset_changes(['deleted'])
 
     @obj_base.remotable
-    def save(self, context):
+    def save(self):
+        context = self._context
         updates = self._get_primitive_changes()
         if 'netmask_v6' in updates:
             # NOTE(danms): For some reason, historical code stores the
@@ -200,6 +207,7 @@ class Network(obj_base.NovaPersistentObject, obj_base.NovaObject):
             self._from_db_object(context, self, db_network)
 
 
+@obj_base.NovaObjectRegistry.register
 class NetworkList(obj_base.ObjectListBase, obj_base.NovaObject):
     # Version 1.0: Initial version
     # Version 1.1: Added get_by_project()
@@ -209,30 +217,32 @@ class NetworkList(obj_base.ObjectListBase, obj_base.NovaObject):
     fields = {
         'objects': fields.ListOfObjectsField('Network'),
         }
-    child_versions = {
-        '1.0': '1.0',
-        '1.1': '1.1',
-        '1.2': '1.2',
+    obj_relationships = {
+        'objects': [('1.0', '1.0'), ('1.1', '1.1'), ('1.2', '1.2')],
         }
 
     @obj_base.remotable_classmethod
     def get_all(cls, context, project_only='allow_none'):
         db_networks = db.network_get_all(context, project_only)
-        return obj_base.obj_make_list(context, cls(), Network, db_networks)
+        return obj_base.obj_make_list(context, cls(context), objects.Network,
+                                      db_networks)
 
     @obj_base.remotable_classmethod
     def get_by_uuids(cls, context, network_uuids, project_only='allow_none'):
         db_networks = db.network_get_all_by_uuids(context, network_uuids,
                                                   project_only)
-        return obj_base.obj_make_list(context, cls(), Network, db_networks)
+        return obj_base.obj_make_list(context, cls(context), objects.Network,
+                                      db_networks)
 
     @obj_base.remotable_classmethod
     def get_by_host(cls, context, host):
         db_networks = db.network_get_all_by_host(context, host)
-        return obj_base.obj_make_list(context, cls(), Network, db_networks)
+        return obj_base.obj_make_list(context, cls(context), objects.Network,
+                                      db_networks)
 
     @obj_base.remotable_classmethod
     def get_by_project(cls, context, project_id, associate=True):
         db_networks = db.project_get_networks(context, project_id,
                                               associate=associate)
-        return obj_base.obj_make_list(context, cls(), Network, db_networks)
+        return obj_base.obj_make_list(context, cls(context), objects.Network,
+                                      db_networks)

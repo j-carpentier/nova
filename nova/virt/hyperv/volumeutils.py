@@ -26,10 +26,11 @@ http://www.microsoft.com/en-us/download/details.aspx?id=34750
 import re
 import time
 
-from oslo.config import cfg
+from oslo_config import cfg
+from oslo_log import log as logging
+from six.moves import range
 
-from nova.openstack.common.gettextutils import _
-from nova.openstack.common import log as logging
+from nova.i18n import _
 from nova import utils
 from nova.virt.hyperv import basevolumeutils
 from nova.virt.hyperv import vmutils
@@ -64,17 +65,18 @@ class VolumeUtils(basevolumeutils.BaseVolumeUtils):
             self.execute('iscsicli.exe', 'RefreshTargetPortal',
                          target_address, target_port)
         else:
-            #Adding target portal to iscsi initiator. Sending targets
+            # Adding target portal to iscsi initiator. Sending targets
             self.execute('iscsicli.exe', 'AddTargetPortal',
                          target_address, target_port,
                          '*', '*', '*', '*', '*', '*', '*', '*', '*', '*', '*',
                          '*', '*')
 
-    def login_storage_target(self, target_lun, target_iqn, target_portal):
+    def login_storage_target(self, target_lun, target_iqn, target_portal,
+                             auth_username=None, auth_password=None):
         """Ensure that the target is logged in."""
 
         self._login_target_portal(target_portal)
-        #Listing targets
+        # Listing targets
         self.execute('iscsicli.exe', 'ListTargets')
 
         retry_count = CONF.hyperv.volume_attach_retry_count
@@ -85,12 +87,13 @@ class VolumeUtils(basevolumeutils.BaseVolumeUtils):
         if retry_count < 2:
             retry_count = 2
 
-        for attempt in xrange(retry_count):
+        for attempt in range(retry_count):
             try:
                 session_info = self.execute('iscsicli.exe', 'SessionList')
                 if session_info.find(target_iqn) == -1:
                     # Sending login
-                    self.execute('iscsicli.exe', 'qlogintarget', target_iqn)
+                    self.execute('iscsicli.exe', 'qlogintarget', target_iqn,
+                                 auth_username, auth_password)
                 else:
                     return
             except vmutils.HyperVException as exc:

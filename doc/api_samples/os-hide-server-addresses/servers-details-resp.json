@@ -1,17 +1,10 @@
 {
     "servers": [
         {
-            "accessIPv4": "",
-            "accessIPv6": "",
-            "addresses": {
-                "private": [
-                    {
-                        "addr": "192.168.0.3",
-                        "version": 4
-                    }
-                ]
-            },
-            "created": "2012-12-19T20:32:37Z",
+            "accessIPv4": "1.2.3.4",
+            "accessIPv6": "80fe::",
+            "addresses": {},
+            "created": "2013-09-24T14:44:01Z",
             "flavor": {
                 "id": "1",
                 "links": [
@@ -21,8 +14,8 @@
                     }
                 ]
             },
-            "hostId": "11c1ae0bb109cd0467c62e96917cfa2956a9f3c1dce9a6565d80f5eb",
-            "id": "625a1d37-3515-49ad-91e2-21075a1b2ccf",
+            "hostId": "a4fa72ae8741e5e18fb062c15657b8f689b8da2837b734c61fc9eedd",
+            "id": "a747eac1-e3ed-446c-935a-c2a2853f919c",
             "image": {
                 "id": "70a599e0-31e7-49b7-b260-868f441e862b",
                 "links": [
@@ -32,13 +25,14 @@
                     }
                 ]
             },
+            "key_name": null,
             "links": [
                 {
-                    "href": "http://openstack.example.com/v2/openstack/servers/625a1d37-3515-49ad-91e2-21075a1b2ccf",
+                    "href": "http://openstack.example.com/v2/openstack/servers/a747eac1-e3ed-446c-935a-c2a2853f919c",
                     "rel": "self"
                 },
                 {
-                    "href": "http://openstack.example.com/openstack/servers/625a1d37-3515-49ad-91e2-21075a1b2ccf",
+                    "href": "http://openstack.example.com/openstack/servers/a747eac1-e3ed-446c-935a-c2a2853f919c",
                     "rel": "bookmark"
                 }
             ],
@@ -49,7 +43,7 @@
             "progress": 0,
             "status": "ACTIVE",
             "tenant_id": "openstack",
-            "updated": "2012-12-19T20:32:39Z",
+            "updated": "2013-09-24T14:44:01Z",
             "user_id": "fake"
         }
     ]

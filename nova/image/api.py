@@ -44,13 +44,13 @@ class API(object):
         """Returns a client session that can be used to query for image
         information.
 
-        :param context: The `nova.context.Context` object for the request
+        :param _context: The `nova.context.Context` object for the request
         """
-        #TODO(jaypipes): Refactor glance.get_remote_image_service and
-        #                glance.get_default_image_service into a single
-        #                method that takes a context and actually respects
-        #                it, returning a real session object that keeps
-        #                the context alive...
+        # TODO(jaypipes): Refactor glance.get_remote_image_service and
+        #                 glance.get_default_image_service into a single
+        #                 method that takes a context and actually respects
+        #                 it, returning a real session object that keeps
+        #                 the context alive...
         return glance.get_default_image_service()
 
     def get_all(self, context, **kwargs):
@@ -61,13 +61,14 @@ class API(object):
         are owned by the requesting user in the ACTIVE status are returned.
 
         :param context: The `nova.context.Context` object for the request
-        :param **kwargs: A dictionary of filter and pagination values that
-                         may be passed to the underlying image info driver.
+        :param kwargs: A dictionary of filter and pagination values that
+                       may be passed to the underlying image info driver.
         """
         session = self._get_session(context)
         return session.detail(context, **kwargs)
 
-    def get(self, context, id_or_uri):
+    def get(self, context, id_or_uri, include_locations=False,
+            show_deleted=True):
         """Retrieves the information record for a single disk image. If the
         supplied identifier parameter is a UUID, the default driver will
         be used to return information about the image. If the supplied
@@ -77,9 +78,19 @@ class API(object):
         :param context: The `nova.context.Context` object for the request
         :param id_or_uri: A UUID identifier or an image URI to look up image
                           information for.
+        :param include_locations: (Optional) include locations in the returned
+                                  dict of information if the image service API
+                                  supports it. If the image service API does
+                                  not support the locations attribute, it will
+                                  still be included in the returned dict, as an
+                                  empty list.
+        :param show_deleted: (Optional) show the image even the status of
+                             image is deleted.
         """
         session, image_id = self._get_session_and_image_id(context, id_or_uri)
-        return session.show(context, image_id)
+        return session.show(context, image_id,
+                            include_locations=include_locations,
+                            show_deleted=show_deleted)
 
     def create(self, context, image_info, data=None):
         """Creates a new image record, optionally passing the image bits to
@@ -108,7 +119,7 @@ class API(object):
                            passed to the image registry.
         :param data: Optional file handle or bytestream iterator that is
                      passed to backend storage.
-        :param purge_props: Optional, defaults to True. If set, the backend
+        :param purge_props: Optional, defaults to False. If set, the backend
                             image registry will clear all image properties
                             and replace them the image properties supplied
                             in the image_info dictionary's 'properties'
@@ -128,3 +139,44 @@ class API(object):
         """
         session, image_id = self._get_session_and_image_id(context, id_or_uri)
         return session.delete(context, image_id)
+
+    def download(self, context, id_or_uri, data=None, dest_path=None):
+        """Transfer image bits from Glance or a known source location to the
+        supplied destination filepath.
+
+        :param context: The `nova.context.RequestContext` object for the
+                        request
+        :param id_or_uri: A UUID identifier or an image URI to look up image
+                          information for.
+        :param data: A file object to use in downloading image data.
+        :param dest_path: Filepath to transfer image bits to.
+
+        Note that because of the poor design of the
+        `glance.ImageService.download` method, the function returns different
+        things depending on what arguments are passed to it. If a data argument
+        is supplied but no dest_path is specified (only done in the XenAPI virt
+        driver's image.utils module) then None is returned from the method. If
+        the data argument is not specified but a destination path *is*
+        specified, then a writeable file handle to the destination path is
+        constructed in the method and the image bits written to that file, and
+        again, None is returned from the method. If no data argument is
+        supplied and no dest_path argument is supplied (VMWare and XenAPI virt
+        drivers), then the method returns an iterator to the image bits that
+        the caller uses to write to wherever location it wants. Finally, if the
+        allow_direct_url_schemes CONF option is set to something, then the
+        nova.image.download modules are used to attempt to do an SCP copy of
+        the image bits from a file location to the dest_path and None is
+        returned after retrying one or more download locations (libvirt and
+        Hyper-V virt drivers through nova.virt.images.fetch).
+
+        I think the above points to just how hacky/wacky all of this code is,
+        and the reason it needs to be cleaned up and standardized across the
+        virt driver callers.
+        """
+        # TODO(jaypipes): Deprecate and remove this method entirely when we
+        #                 move to a system that simply returns a file handle
+        #                 to a bytestream iterator and allows the caller to
+        #                 handle streaming/copying/zero-copy as they see fit.
+        session, image_id = self._get_session_and_image_id(context, id_or_uri)
+        return session.download(context, image_id, data=data,
+                                dst_path=dest_path)

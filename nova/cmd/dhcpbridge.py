@@ -24,21 +24,20 @@ import os
 import sys
 import traceback
 
-from oslo.config import cfg
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_serialization import jsonutils
+from oslo_utils import importutils
 
 from nova.conductor import rpcapi as conductor_rpcapi
 from nova import config
 from nova import context
 import nova.db.api
 from nova import exception
+from nova.i18n import _LE
 from nova.network import rpcapi as network_rpcapi
 from nova import objects
 from nova.objects import base as objects_base
-from nova.objects import network as network_obj
-from nova.openstack.common.gettextutils import _
-from nova.openstack.common import importutils
-from nova.openstack.common import jsonutils
-from nova.openstack.common import log as logging
 from nova import rpc
 
 CONF = cfg.CONF
@@ -66,19 +65,19 @@ def del_lease(mac, ip_address):
     """Called when a lease expires."""
     api = network_rpcapi.NetworkAPI()
     api.release_fixed_ip(context.get_admin_context(), ip_address,
-                         CONF.host)
+                         CONF.host, mac)
 
 
 def init_leases(network_id):
     """Get the list of hosts for a network."""
     ctxt = context.get_admin_context()
-    network = network_obj.Network.get_by_id(ctxt, network_id)
+    network = objects.Network.get_by_id(ctxt, network_id)
     network_manager = importutils.import_object(CONF.network_manager)
     return network_manager.get_dhcp_leases(ctxt, network)
 
 
 def add_action_parsers(subparsers):
-    parser = subparsers.add_parser('init')
+    subparsers.add_parser('init')
 
     # NOTE(cfb): dnsmasq always passes mac, and ip. hostname
     #            is passed if known. We don't care about
@@ -106,7 +105,7 @@ def block_db_access():
 
         def __call__(self, *args, **kwargs):
             stacktrace = "".join(traceback.format_stack())
-            LOG.error(_('No db access allowed in nova-dhcpbridge: %s'),
+            LOG.error(_LE('No db access allowed in nova-dhcpbridge: %s'),
                       stacktrace)
             raise exception.DBNotAllowed('nova-dhcpbridge')
 
@@ -118,7 +117,7 @@ def main():
     config.parse_args(sys.argv,
         default_config_files=jsonutils.loads(os.environ['CONFIG_FILE']))
 
-    logging.setup("nova")
+    logging.setup(CONF, "nova")
     global LOG
     LOG = logging.getLogger('nova.dhcpbridge')
     objects.register_all()
@@ -129,17 +128,16 @@ def main():
             conductor_rpcapi.ConductorAPI()
 
     if CONF.action.name in ['add', 'del', 'old']:
-        msg = (_("Called '%(action)s' for mac '%(mac)s' with ip '%(ip)s'") %
-               {"action": CONF.action.name,
-                "mac": CONF.action.mac,
-                "ip": CONF.action.ip})
-        LOG.debug(msg)
+        LOG.debug("Called '%(action)s' for mac '%(mac)s' with ip '%(ip)s'",
+                  {"action": CONF.action.name,
+                   "mac": CONF.action.mac,
+                   "ip": CONF.action.ip})
         CONF.action.func(CONF.action.mac, CONF.action.ip)
     else:
         try:
             network_id = int(os.environ.get('NETWORK_ID'))
         except TypeError:
-            LOG.error(_("Environment variable 'NETWORK_ID' must be set."))
+            LOG.error(_LE("Environment variable 'NETWORK_ID' must be set."))
             return(1)
 
         print(init_leases(network_id))

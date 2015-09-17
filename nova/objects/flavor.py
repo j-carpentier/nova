@@ -14,6 +14,7 @@
 
 from nova import db
 from nova import exception
+from nova import objects
 from nova.objects import base
 from nova.objects import fields
 
@@ -21,7 +22,10 @@ from nova.objects import fields
 OPTIONAL_FIELDS = ['extra_specs', 'projects']
 
 
-class Flavor(base.NovaPersistentObject, base.NovaObject):
+# TODO(berrange): Remove NovaObjectDictCompat
+@base.NovaObjectRegistry.register
+class Flavor(base.NovaPersistentObject, base.NovaObject,
+             base.NovaObjectDictCompat):
     # Version 1.0: Initial version
     # Version 1.1: Added save_projects(), save_extra_specs(), removed
     #              remoteable from save()
@@ -47,12 +51,13 @@ class Flavor(base.NovaPersistentObject, base.NovaObject):
     def __init__(self, *args, **kwargs):
         super(Flavor, self).__init__(*args, **kwargs)
         self._orig_extra_specs = {}
-        self._orig_projects = {}
+        self._orig_projects = []
 
     @staticmethod
     def _from_db_object(context, flavor, db_flavor, expected_attrs=None):
         if expected_attrs is None:
             expected_attrs = []
+        flavor._context = context
         for name, field in flavor.fields.items():
             if name in OPTIONAL_FIELDS:
                 continue
@@ -65,18 +70,17 @@ class Flavor(base.NovaPersistentObject, base.NovaObject):
             flavor.extra_specs = db_flavor['extra_specs']
 
         if 'projects' in expected_attrs:
-            flavor._load_projects(context)
+            flavor._load_projects()
 
-        flavor._context = context
         flavor.obj_reset_changes()
         return flavor
 
     @base.remotable
-    def _load_projects(self, context):
+    def _load_projects(self):
         self.projects = [x['project_id'] for x in
-                         db.flavor_access_get_by_flavor_id(context,
+                         db.flavor_access_get_by_flavor_id(self._context,
                                                            self.flavorid)]
-        self.obj_reset_changes('projects')
+        self.obj_reset_changes(['projects'])
 
     def obj_load_attr(self, attrname):
         # NOTE(danms): Only projects could be lazy-loaded right now
@@ -86,8 +90,9 @@ class Flavor(base.NovaPersistentObject, base.NovaObject):
 
         self._load_projects()
 
-    def obj_reset_changes(self, fields=None):
-        super(Flavor, self).obj_reset_changes(fields=fields)
+    def obj_reset_changes(self, fields=None, recursive=False):
+        super(Flavor, self).obj_reset_changes(fields=fields,
+                recursive=recursive)
         if fields is None or 'extra_specs' in fields:
             self._orig_extra_specs = (dict(self.extra_specs)
                                       if self.obj_attr_is_set('extra_specs')
@@ -96,6 +101,15 @@ class Flavor(base.NovaPersistentObject, base.NovaObject):
             self._orig_projects = (list(self.projects)
                                    if self.obj_attr_is_set('projects')
                                    else [])
+
+    def obj_what_changed(self):
+        changes = super(Flavor, self).obj_what_changed()
+        if ('extra_specs' in self and
+            self.extra_specs != self._orig_extra_specs):
+            changes.add('extra_specs')
+        if 'projects' in self and self.projects != self._orig_projects:
+            changes.add('projects')
+        return changes
 
     @classmethod
     def _obj_from_primitive(cls, context, objver, primitive):
@@ -117,40 +131,40 @@ class Flavor(base.NovaPersistentObject, base.NovaObject):
     @base.remotable_classmethod
     def get_by_id(cls, context, id):
         db_flavor = db.flavor_get(context, id)
-        return cls._from_db_object(context, cls(), db_flavor,
+        return cls._from_db_object(context, cls(context), db_flavor,
                                    expected_attrs=['extra_specs'])
 
     @base.remotable_classmethod
     def get_by_name(cls, context, name):
         db_flavor = db.flavor_get_by_name(context, name)
-        return cls._from_db_object(context, cls(), db_flavor,
+        return cls._from_db_object(context, cls(context), db_flavor,
                                    expected_attrs=['extra_specs'])
 
     @base.remotable_classmethod
     def get_by_flavor_id(cls, context, flavor_id, read_deleted=None):
         db_flavor = db.flavor_get_by_flavor_id(context, flavor_id,
                                                read_deleted)
-        return cls._from_db_object(context, cls(), db_flavor,
+        return cls._from_db_object(context, cls(context), db_flavor,
                                    expected_attrs=['extra_specs'])
 
     @base.remotable
-    def add_access(self, context, project_id):
+    def add_access(self, project_id):
         if 'projects' in self.obj_what_changed():
             raise exception.ObjectActionError(action='add_access',
                                               reason='projects modified')
-        db.flavor_access_add(context, self.flavorid, project_id)
-        self._load_projects(context)
+        db.flavor_access_add(self._context, self.flavorid, project_id)
+        self._load_projects()
 
     @base.remotable
-    def remove_access(self, context, project_id):
+    def remove_access(self, project_id):
         if 'projects' in self.obj_what_changed():
             raise exception.ObjectActionError(action='remove_access',
                                               reason='projects modified')
-        db.flavor_access_remove(context, self.flavorid, project_id)
-        self._load_projects(context)
+        db.flavor_access_remove(self._context, self.flavorid, project_id)
+        self._load_projects()
 
     @base.remotable
-    def create(self, context):
+    def create(self):
         if self.obj_attr_is_set('id'):
             raise exception.ObjectActionError(action='create',
                                               reason='already created')
@@ -160,12 +174,12 @@ class Flavor(base.NovaPersistentObject, base.NovaObject):
             if attr in updates:
                 expected_attrs.append(attr)
         projects = updates.pop('projects', [])
-        db_flavor = db.flavor_create(context, updates, projects=projects)
-        self._from_db_object(context, self, db_flavor,
+        db_flavor = db.flavor_create(self._context, updates, projects=projects)
+        self._from_db_object(self._context, self, db_flavor,
                              expected_attrs=expected_attrs)
 
     @base.remotable
-    def save_projects(self, context, to_add=None, to_delete=None):
+    def save_projects(self, to_add=None, to_delete=None):
         """Add or delete projects.
 
         :param:to_add: A list of projects to add
@@ -176,30 +190,32 @@ class Flavor(base.NovaPersistentObject, base.NovaObject):
         to_delete = to_delete if to_delete is not None else []
 
         for project_id in to_add:
-            db.flavor_access_add(context, self.flavorid, project_id)
+            db.flavor_access_add(self._context, self.flavorid, project_id)
         for project_id in to_delete:
-            db.flavor_access_remove(context, self.flavorid, project_id)
+            db.flavor_access_remove(self._context, self.flavorid, project_id)
         self.obj_reset_changes(['projects'])
 
     @base.remotable
-    def save_extra_specs(self, context, to_add=None, to_delete=None):
+    def save_extra_specs(self, to_add=None, to_delete=None):
         """Add or delete extra_specs.
 
         :param:to_add: A dict of new keys to add/update
         :param:to_delete: A list of keys to remove
         """
 
-        to_add = to_add if to_add is not None else []
+        to_add = to_add if to_add is not None else {}
         to_delete = to_delete if to_delete is not None else []
 
-        db.flavor_extra_specs_update_or_create(context, self.flavorid,
-                                               to_add)
+        if to_add:
+            db.flavor_extra_specs_update_or_create(self._context,
+                                                   self.flavorid,
+                                                   to_add)
+
         for key in to_delete:
-            db.flavor_extra_specs_delete(context, self.flavorid, key)
+            db.flavor_extra_specs_delete(self._context, self.flavorid, key)
         self.obj_reset_changes(['extra_specs'])
 
     def save(self):
-        context = self._context
         updates = self.obj_get_changes()
         projects = updates.pop('projects', None)
         extra_specs = updates.pop('extra_specs', None)
@@ -226,25 +242,25 @@ class Flavor(base.NovaPersistentObject, base.NovaObject):
         # call these methods to update them.
 
         if added_keys or deleted_keys:
-            self.save_extra_specs(context, self.extra_specs, deleted_keys)
+            self.save_extra_specs(self.extra_specs, deleted_keys)
 
         if added_projects or deleted_projects:
-            self.save_projects(context, added_projects, deleted_projects)
+            self.save_projects(added_projects, deleted_projects)
 
     @base.remotable
-    def destroy(self, context):
-        db.flavor_destroy(context, self.name)
+    def destroy(self):
+        db.flavor_destroy(self._context, self.name)
 
 
+@base.NovaObjectRegistry.register
 class FlavorList(base.ObjectListBase, base.NovaObject):
     VERSION = '1.1'
 
     fields = {
         'objects': fields.ListOfObjectsField('Flavor'),
         }
-    child_versions = {
-        '1.0': '1.0',
-        '1.1': '1.1',
+    obj_relationships = {
+        'objects': [('1.0', '1.0'), ('1.1', '1.1')],
         }
 
     @base.remotable_classmethod
@@ -254,5 +270,5 @@ class FlavorList(base.ObjectListBase, base.NovaObject):
                                        filters=filters, sort_key=sort_key,
                                        sort_dir=sort_dir, limit=limit,
                                        marker=marker)
-        return base.obj_make_list(context, cls(), Flavor, db_flavors,
-                                  expected_attrs=['extra_specs'])
+        return base.obj_make_list(context, cls(context), objects.Flavor,
+                                  db_flavors, expected_attrs=['extra_specs'])

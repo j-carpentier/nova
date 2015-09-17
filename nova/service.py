@@ -21,19 +21,21 @@ import os
 import random
 import sys
 
-from oslo.config import cfg
-from oslo import messaging
+from oslo_concurrency import processutils
+from oslo_config import cfg
+from oslo_log import log as logging
+import oslo_messaging as messaging
+from oslo_service import service
+from oslo_utils import importutils
 
 from nova import baserpc
 from nova import conductor
 from nova import context
 from nova import debugger
 from nova import exception
+from nova.i18n import _, _LE, _LI, _LW
+from nova import objects
 from nova.objects import base as objects_base
-from nova.openstack.common.gettextutils import _
-from nova.openstack.common import importutils
-from nova.openstack.common import log as logging
-from nova.openstack.common import service
 from nova import rpc
 from nova import servicegroup
 from nova import utils
@@ -65,6 +67,8 @@ service_opts = [
                help='The IP address on which the EC2 API will listen.'),
     cfg.IntOpt('ec2_listen_port',
                default=8773,
+               min=1,
+               max=65535,
                help='The port on which the EC2 API will listen.'),
     cfg.IntOpt('ec2_workers',
                help='Number of workers for EC2 API service. The default will '
@@ -74,6 +78,8 @@ service_opts = [
                help='The IP address on which the OpenStack API will listen.'),
     cfg.IntOpt('osapi_compute_listen_port',
                default=8774,
+               min=1,
+               max=65535,
                help='The port on which the OpenStack API will listen.'),
     cfg.IntOpt('osapi_compute_workers',
                help='Number of workers for OpenStack API service. The default '
@@ -86,6 +92,8 @@ service_opts = [
                help='The IP address on which the metadata API will listen.'),
     cfg.IntOpt('metadata_listen_port',
                default=8775,
+               min=1,
+               max=65535,
                help='The port on which the metadata API will listen.'),
     cfg.IntOpt('metadata_workers',
                help='Number of workers for metadata service. The default will '
@@ -123,7 +131,7 @@ class Service(service.Service):
 
     A service takes a manager and enables rpc by listening to queues based
     on topic. It also periodically runs tasks on the manager and reports
-    it state to the database services table.
+    its state to the database services table.
     """
 
     def __init__(self, host, binary, topic, manager, report_interval=None,
@@ -135,14 +143,7 @@ class Service(service.Service):
         self.binary = binary
         self.topic = topic
         self.manager_class_name = manager
-        # NOTE(russellb) We want to make sure to create the servicegroup API
-        # instance early, before creating other things such as the manager,
-        # that will also create a servicegroup API instance.  Internally, the
-        # servicegroup only allocates a single instance of the driver API and
-        # we want to make sure that our value of db_allowed is there when it
-        # gets created.  For that to happen, this has to be the first instance
-        # of the servicegroup API.
-        self.servicegroup_api = servicegroup.API(db_allowed=db_allowed)
+        self.servicegroup_api = servicegroup.API()
         manager_class = importutils.import_class(self.manager_class_name)
         self.manager = manager_class(host=self.host, *args, **kwargs)
         self.rpcserver = None
@@ -157,24 +158,23 @@ class Service(service.Service):
 
     def start(self):
         verstr = version.version_string_with_package()
-        LOG.audit(_('Starting %(topic)s node (version %(version)s)'),
+        LOG.info(_LI('Starting %(topic)s node (version %(version)s)'),
                   {'topic': self.topic, 'version': verstr})
         self.basic_config_check()
         self.manager.init_host()
         self.model_disconnected = False
         ctxt = context.get_admin_context()
-        try:
-            self.service_ref = self.conductor_api.service_get_by_args(ctxt,
-                    self.host, self.binary)
-            self.service_id = self.service_ref['id']
-        except exception.NotFound:
+        self.service_ref = objects.Service.get_by_host_and_binary(
+            ctxt, self.host, self.binary)
+        if not self.service_ref:
             try:
                 self.service_ref = self._create_service_ref(ctxt)
-            except exception.ServiceTopicExists:
+            except (exception.ServiceTopicExists,
+                    exception.ServiceBinaryExists):
                 # NOTE(danms): If we race to create a record with a sibling
                 # worker, don't fail here.
-                self.service_ref = self.conductor_api.service_get_by_args(ctxt,
-                    self.host, self.binary)
+                self.service_ref = objects.Service.get_by_host_and_binary(
+                    ctxt, self.host, self.binary)
 
         self.manager.pre_start_hook()
 
@@ -215,14 +215,12 @@ class Service(service.Service):
                                         self.periodic_interval_max)
 
     def _create_service_ref(self, context):
-        svc_values = {
-            'host': self.host,
-            'binary': self.binary,
-            'topic': self.topic,
-            'report_count': 0
-        }
-        service = self.conductor_api.service_create(context, svc_values)
-        self.service_id = service['id']
+        service = objects.Service(context)
+        service.host = self.host
+        service.binary = self.binary
+        service.topic = self.topic
+        service.report_count = 0
+        service.create()
         return service
 
     def __getattr__(self, key):
@@ -278,10 +276,9 @@ class Service(service.Service):
         """Destroy the service object in the datastore."""
         self.stop()
         try:
-            self.conductor_api.service_destroy(context.get_admin_context(),
-                                               self.service_id)
+            self.service_ref.destroy()
         except exception.NotFound:
-            LOG.warn(_('Service killed that has no database entry'))
+            LOG.warning(_LW('Service killed that has no database entry'))
 
     def stop(self):
         try:
@@ -293,7 +290,7 @@ class Service(service.Service):
         try:
             self.manager.cleanup_host()
         except Exception:
-            LOG.exception(_('Service error occurred during cleanup_host'))
+            LOG.exception(_LE('Service error occurred during cleanup_host'))
             pass
 
         super(Service, self).stop()
@@ -310,11 +307,11 @@ class Service(service.Service):
             with utils.tempdir():
                 pass
         except Exception as e:
-            LOG.error(_('Temporary directory is invalid: %s'), e)
+            LOG.error(_LE('Temporary directory is invalid: %s'), e)
             sys.exit(1)
 
 
-class WSGIService(object):
+class WSGIService(service.Service):
     """Provides ability to launch API from a 'paste' configuration."""
 
     def __init__(self, name, loader=None, use_ssl=False, max_url_len=None):
@@ -329,10 +326,15 @@ class WSGIService(object):
         self.manager = self._get_manager()
         self.loader = loader or wsgi.Loader()
         self.app = self.loader.load_app(name)
+        # inherit all compute_api worker counts from osapi_compute
+        if name.startswith('openstack_compute_api'):
+            wname = 'osapi_compute'
+        else:
+            wname = name
         self.host = getattr(CONF, '%s_listen' % name, "0.0.0.0")
         self.port = getattr(CONF, '%s_listen_port' % name, 0)
-        self.workers = (getattr(CONF, '%s_workers' % name, None) or
-                        utils.cpu_count())
+        self.workers = (getattr(CONF, '%s_workers' % wname, None) or
+                        processutils.get_worker_count())
         if self.workers and self.workers < 1:
             worker_name = '%s_workers' % name
             msg = (_("%(worker_name)s value of %(workers)s is invalid, "
@@ -350,6 +352,14 @@ class WSGIService(object):
         # Pull back actual port used
         self.port = self.server.port
         self.backdoor_port = None
+
+    def reset(self):
+        """Reset server greenpool size to default.
+
+        :returns: None
+
+        """
+        self.server.reset()
 
     def _get_manager(self):
         """Initialize a Manager object appropriate for this service.
@@ -408,7 +418,7 @@ class WSGIService(object):
 
 
 def process_launcher():
-    return service.ProcessLauncher()
+    return service.ProcessLauncher(CONF)
 
 
 # NOTE(vish): the global launcher is to maintain the existing
@@ -422,7 +432,7 @@ def serve(server, workers=None):
     if _launcher:
         raise RuntimeError(_('serve() can only be called once'))
 
-    _launcher = service.launch(server, workers=workers)
+    _launcher = service.launch(CONF, server, workers=workers)
 
 
 def wait():

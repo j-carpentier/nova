@@ -26,13 +26,13 @@ continue attempting to launch the rest of the services.
 
 import sys
 
-from oslo.config import cfg
+from oslo_config import cfg
+from oslo_log import log as logging
 
 from nova import config
+from nova.i18n import _LE
 from nova import objects
 from nova.objectstore import s3server
-from nova.openstack.common.gettextutils import _
-from nova.openstack.common import log as logging
 from nova import service
 from nova import utils
 from nova.vnc import xvp_proxy
@@ -47,7 +47,7 @@ CONF.import_opt('enabled_ssl_apis', 'nova.service')
 
 def main():
     config.parse_args(sys.argv)
-    logging.setup("nova")
+    logging.setup(CONF, "nova")
     LOG = logging.getLogger('nova.all')
     utils.monkey_patch()
     objects.register_all()
@@ -60,13 +60,13 @@ def main():
             server = service.WSGIService(api, use_ssl=should_use_ssl)
             launcher.launch_service(server, workers=server.workers or 1)
         except (Exception, SystemExit):
-            LOG.exception(_('Failed to load %s') % '%s-api' % api)
+            LOG.exception(_LE('Failed to load %s-api'), api)
 
     for mod in [s3server, xvp_proxy]:
         try:
             launcher.launch_service(mod.get_wsgi_server())
         except (Exception, SystemExit):
-            LOG.exception(_('Failed to load %s') % mod.__name__)
+            LOG.exception(_LE('Failed to load %s'), mod.__name__)
 
     for binary in ['nova-compute', 'nova-network', 'nova-scheduler',
                    'nova-cert', 'nova-conductor']:
@@ -89,5 +89,5 @@ def main():
                                                            topic=topic,
                                                           manager=manager))
         except (Exception, SystemExit):
-            LOG.exception(_('Failed to load %s'), binary)
+            LOG.exception(_LE('Failed to load %s'), binary)
     launcher.wait()

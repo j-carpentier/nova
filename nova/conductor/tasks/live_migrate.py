@@ -10,19 +10,17 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from oslo.config import cfg
+from oslo_config import cfg
+from oslo_log import log as logging
+import oslo_messaging as messaging
 
 from nova.compute import power_state
-from nova.compute import rpcapi as compute_rpcapi
-from nova.compute import utils as compute_utils
-from nova import db
+from nova.conductor.tasks import base
 from nova import exception
-from nova import image
-from nova.openstack.common.gettextutils import _
-from nova.openstack.common import log as logging
-from nova.scheduler import rpcapi as scheduler_rpcapi
+from nova.i18n import _
+from nova import objects
 from nova.scheduler import utils as scheduler_utils
-from nova import servicegroup
+from nova import utils
 
 LOG = logging.getLogger(__name__)
 
@@ -36,55 +34,63 @@ CONF = cfg.CONF
 CONF.register_opt(migrate_opt)
 
 
-class LiveMigrationTask(object):
+class LiveMigrationTask(base.TaskBase):
     def __init__(self, context, instance, destination,
-                 block_migration, disk_over_commit):
-        self.context = context
-        self.instance = instance
+                 block_migration, disk_over_commit, migration, compute_rpcapi,
+                 servicegroup_api, scheduler_client):
+        super(LiveMigrationTask, self).__init__(context, instance)
         self.destination = destination
         self.block_migration = block_migration
         self.disk_over_commit = disk_over_commit
+        self.migration = migration
         self.source = instance.host
         self.migrate_data = None
-        self.compute_rpcapi = compute_rpcapi.ComputeAPI()
-        self.servicegroup_api = servicegroup.API()
-        self.scheduler_rpcapi = scheduler_rpcapi.SchedulerAPI()
-        self.image_api = image.API()
 
-    def execute(self):
-        self._check_instance_is_running()
+        self.compute_rpcapi = compute_rpcapi
+        self.servicegroup_api = servicegroup_api
+        self.scheduler_client = scheduler_client
+
+    def _execute(self):
+        self._check_instance_is_active()
         self._check_host_is_up(self.source)
 
         if not self.destination:
             self.destination = self._find_destination()
+            self.migration.dest_compute = self.destination
+            self.migration.save()
         else:
             self._check_requested_destination()
 
-        #TODO(johngarbutt) need to move complexity out of compute manager
-        #TODO(johngarbutt) disk_over_commit?
+        # TODO(johngarbutt) need to move complexity out of compute manager
+        # TODO(johngarbutt) disk_over_commit?
         return self.compute_rpcapi.live_migration(self.context,
                 host=self.source,
                 instance=self.instance,
                 dest=self.destination,
                 block_migration=self.block_migration,
+                migration=self.migration,
                 migrate_data=self.migrate_data)
 
     def rollback(self):
-        #TODO(johngarbutt) need to implement the clean up operation
+        # TODO(johngarbutt) need to implement the clean up operation
         # but this will make sense only once we pull in the compute
         # calls, since this class currently makes no state changes,
         # except to call the compute method, that has no matching
         # rollback call right now.
-        raise NotImplementedError()
+        pass
 
-    def _check_instance_is_running(self):
-        if self.instance.power_state != power_state.RUNNING:
-            raise exception.InstanceNotRunning(
-                    instance_id=self.instance.uuid)
+    def _check_instance_is_active(self):
+        if self.instance.power_state not in (power_state.RUNNING,
+                                             power_state.PAUSED):
+            raise exception.InstanceInvalidState(
+                    instance_uuid = self.instance.uuid,
+                    attr = 'power_state',
+                    state = self.instance.power_state,
+                    method = 'live migrate')
 
     def _check_host_is_up(self, host):
         try:
-            service = db.service_get_by_compute_host(self.context, host)
+            service = objects.Service.get_by_compute_host(self.context, host)
         except exception.NotFound:
             raise exception.ComputeServiceUnavailable(host=host)
 
@@ -118,8 +124,8 @@ class LiveMigrationTask(object):
                     mem_inst=mem_inst))
 
     def _get_compute_info(self, host):
-        service_ref = db.service_get_by_compute_host(self.context, host)
-        return service_ref['compute_node'][0]
+        return objects.ComputeNode.get_first_node_by_host_for_old_compat(
+            self.context, host)
 
     def _check_compatible_with_source_hypervisor(self, destination):
         source_info = self._get_compute_info(self.source)
@@ -136,19 +142,20 @@ class LiveMigrationTask(object):
             raise exception.DestinationHypervisorTooOld()
 
     def _call_livem_checks_on_host(self, destination):
-        self.migrate_data = self.compute_rpcapi.\
-            check_can_live_migrate_destination(self.context, self.instance,
-                destination, self.block_migration, self.disk_over_commit)
+        try:
+            self.migrate_data = self.compute_rpcapi.\
+                check_can_live_migrate_destination(self.context, self.instance,
+                    destination, self.block_migration, self.disk_over_commit)
+        except messaging.MessagingTimeout:
+            msg = _("Timeout while checking if we can live migrate to host: "
+                    "%s") % destination
+            raise exception.MigrationPreCheckError(msg)
 
     def _find_destination(self):
-        #TODO(johngarbutt) this retry loop should be shared
+        # TODO(johngarbutt) this retry loop should be shared
         attempted_hosts = [self.source]
-        image = None
-        if self.instance.image_ref:
-            image = compute_utils.get_image_metadata(self.context,
-                                                     self.image_api,
-                                                     self.instance.image_ref,
-                                                     self.instance)
+        image = utils.get_image_from_system_metadata(
+            self.instance.system_metadata)
         request_spec = scheduler_utils.build_request_spec(self.context, image,
                                                           [self.instance])
 
@@ -156,12 +163,14 @@ class LiveMigrationTask(object):
         while host is None:
             self._check_not_over_max_retries(attempted_hosts)
             filter_properties = {'ignore_hosts': attempted_hosts}
-            host = self.scheduler_rpcapi.select_destinations(self.context,
+            scheduler_utils.setup_instance_group(self.context, request_spec,
+                                                 filter_properties)
+            host = self.scheduler_client.select_destinations(self.context,
                             request_spec, filter_properties)[0]['host']
             try:
                 self._check_compatible_with_source_hypervisor(host)
                 self._call_livem_checks_on_host(host)
-            except exception.Invalid as e:
+            except (exception.Invalid, exception.MigrationPreCheckError) as e:
                 LOG.debug("Skipping host: %(host)s because: %(e)s",
                     {"host": host, "e": e})
                 attempted_hosts.append(host)
@@ -178,14 +187,4 @@ class LiveMigrationTask(object):
                      'instance %(instance_uuid)s during live migration')
                    % {'max_retries': retries,
                       'instance_uuid': self.instance.uuid})
-            raise exception.NoValidHost(reason=msg)
-
-
-def execute(context, instance, destination,
-            block_migration, disk_over_commit):
-    task = LiveMigrationTask(context, instance,
-                             destination,
-                             block_migration,
-                             disk_over_commit)
-    #TODO(johngarbutt) create a superclass that contains a safe_execute call
-    return task.execute()
+            raise exception.MaxRetriesExceeded(reason=msg)

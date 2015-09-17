@@ -12,19 +12,23 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from oslo_log import log as logging
+
 from nova.cells import opts as cells_opts
 from nova.cells import rpcapi as cells_rpcapi
 from nova import db
 from nova import exception
+from nova.i18n import _LE
 from nova.objects import base
 from nova.objects import fields
-from nova.openstack.common.gettextutils import _
-from nova.openstack.common import log as logging
 
 LOG = logging.getLogger(__name__)
 
 
-class InstanceInfoCache(base.NovaPersistentObject, base.NovaObject):
+# TODO(berrange): Remove NovaObjectDictCompat
+@base.NovaObjectRegistry.register
+class InstanceInfoCache(base.NovaPersistentObject, base.NovaObject,
+                        base.NovaObjectDictCompat):
     # Version 1.0: Initial version
     # Version 1.1: Converted network_info to store the model.
     # Version 1.2: Added new() and update_cells kwarg to save().
@@ -68,7 +72,7 @@ class InstanceInfoCache(base.NovaPersistentObject, base.NovaObject):
         if not db_obj:
             raise exception.InstanceInfoCacheNotFound(
                     instance_uuid=instance_uuid)
-        return InstanceInfoCache._from_db_object(context, cls(), db_obj)
+        return cls._from_db_object(context, cls(context), db_obj)
 
     @staticmethod
     def _info_cache_cells_update(ctxt, info_cache):
@@ -79,27 +83,33 @@ class InstanceInfoCache(base.NovaPersistentObject, base.NovaObject):
         try:
             cells_api.instance_info_cache_update_at_top(ctxt, info_cache)
         except Exception:
-            LOG.exception(_("Failed to notify cells of instance info "
-                            "cache update"))
+            LOG.exception(_LE("Failed to notify cells of instance info "
+                              "cache update"))
 
     @base.remotable
-    def save(self, context, update_cells=True):
+    def save(self, update_cells=True):
         if 'network_info' in self.obj_what_changed():
+            if update_cells:
+                stale_instance = self.obj_clone()
             nw_info_json = self.fields['network_info'].to_primitive(
                 self, 'network_info', self.network_info)
-            rv = db.instance_info_cache_update(context, self.instance_uuid,
+            rv = db.instance_info_cache_update(self._context,
+                                               self.instance_uuid,
                                                {'network_info': nw_info_json})
-            if update_cells and rv:
-                self._info_cache_cells_update(context, rv)
+            self._from_db_object(self._context, self, rv)
+            if update_cells:
+                # Send a copy of ourselves before updates are applied so
+                # that cells can tell what changed.
+                self._info_cache_cells_update(self._context, stale_instance)
         self.obj_reset_changes()
 
     @base.remotable
-    def delete(self, context):
-        db.instance_info_cache_delete(context, self.instance_uuid)
+    def delete(self):
+        db.instance_info_cache_delete(self._context, self.instance_uuid)
 
     @base.remotable
-    def refresh(self, context):
-        current = self.__class__.get_by_instance_uuid(context,
+    def refresh(self):
+        current = self.__class__.get_by_instance_uuid(self._context,
                                                       self.instance_uuid)
         current._context = None
 

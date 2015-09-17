@@ -17,32 +17,76 @@ import functools
 
 import eventlet
 import netaddr
+from oslo_serialization import jsonutils
 import six
 
 from nova import exception
-from nova.openstack.common.gettextutils import _
-from nova.openstack.common import jsonutils
+from nova.i18n import _
 
 
 def ensure_string_keys(d):
     # http://bugs.python.org/issue4978
-    return dict([(str(k), v) for k, v in d.iteritems()])
+    return {str(k): v for k, v in six.iteritems(d)}
 
 # Constants for the 'vif_type' field in VIF class
 VIF_TYPE_OVS = 'ovs'
 VIF_TYPE_IVS = 'ivs'
+VIF_TYPE_DVS = 'dvs'
 VIF_TYPE_IOVISOR = 'iovisor'
 VIF_TYPE_BRIDGE = 'bridge'
 VIF_TYPE_802_QBG = '802.1qbg'
 VIF_TYPE_802_QBH = '802.1qbh'
+VIF_TYPE_HW_VEB = 'hw_veb'
 VIF_TYPE_MLNX_DIRECT = 'mlnx_direct'
+VIF_TYPE_IB_HOSTDEV = 'ib_hostdev'
 VIF_TYPE_MIDONET = 'midonet'
+VIF_TYPE_VHOSTUSER = 'vhostuser'
+VIF_TYPE_VROUTER = 'vrouter'
 VIF_TYPE_OTHER = 'other'
+VIF_TYPE_TAP = 'tap'
+VIF_TYPE_MACVTAP = 'macvtap'
+VIF_TYPE_BINDING_FAILED = 'binding_failed'
 
 # Constants for dictionary keys in the 'vif_details' field in the VIF
 # class
-VIF_DETAIL_PORT_FILTER = 'port_filter'
-VIF_DETAIL_OVS_HYBRID_PLUG = 'ovs_hybrid_plug'
+VIF_DETAILS_PORT_FILTER = 'port_filter'
+VIF_DETAILS_OVS_HYBRID_PLUG = 'ovs_hybrid_plug'
+VIF_DETAILS_PHYSICAL_NETWORK = 'physical_network'
+
+# The following constant defines an SR-IOV related parameter in the
+# 'vif_details'. 'profileid' should be used for VIF_TYPE_802_QBH
+VIF_DETAILS_PROFILEID = 'profileid'
+
+# The following constant defines an SR-IOV and macvtap related parameter in
+# the 'vif_details'. 'vlan' should be used for VIF_TYPE_HW_VEB or
+# VIF_TYPE_MACVTAP
+VIF_DETAILS_VLAN = 'vlan'
+
+# The following three constants define the macvtap related fields in
+# the 'vif_details'.
+VIF_DETAILS_MACVTAP_SOURCE = 'macvtap_source'
+VIF_DETAILS_MACVTAP_MODE = 'macvtap_mode'
+VIF_DETAILS_PHYS_INTERFACE = 'physical_interface'
+
+# Constants for vhost-user related fields in 'vif_details'.
+# Sets mode on vhost-user socket, valid values are 'client'
+# and 'server'
+VIF_DETAILS_VHOSTUSER_MODE = 'vhostuser_mode'
+# vhost-user socket path
+VIF_DETAILS_VHOSTUSER_SOCKET = 'vhostuser_socket'
+# Specifies whether vhost-user socket should be plugged
+# into ovs bridge. Valid values are True and False
+VIF_DETAILS_VHOSTUSER_OVS_PLUG = 'vhostuser_ovs_plug'
+
+# Constants for dictionary keys in the 'vif_details' field that are
+# valid for VIF_TYPE_TAP.
+VIF_DETAILS_TAP_MAC_ADDRESS = 'mac_address'
+
+# Define supported virtual NIC types. VNIC_TYPE_DIRECT and VNIC_TYPE_MACVTAP
+# are used for SR-IOV ports
+VNIC_TYPE_NORMAL = 'normal'
+VNIC_TYPE_DIRECT = 'direct'
+VNIC_TYPE_MACVTAP = 'macvtap'
 
 # Constants for the 'vif_model' values
 VIF_MODEL_VIRTIO = 'virtio'
@@ -52,6 +96,25 @@ VIF_MODEL_RTL8139 = 'rtl8139'
 VIF_MODEL_E1000 = 'e1000'
 VIF_MODEL_E1000E = 'e1000e'
 VIF_MODEL_NETFRONT = 'netfront'
+VIF_MODEL_SPAPR_VLAN = 'spapr-vlan'
+
+VIF_MODEL_SRIOV = 'sriov'
+VIF_MODEL_VMXNET = 'vmxnet'
+VIF_MODEL_VMXNET3 = 'vmxnet3'
+
+VIF_MODEL_ALL = (
+    VIF_MODEL_VIRTIO,
+    VIF_MODEL_NE2K_PCI,
+    VIF_MODEL_PCNET,
+    VIF_MODEL_RTL8139,
+    VIF_MODEL_E1000,
+    VIF_MODEL_E1000E,
+    VIF_MODEL_NETFRONT,
+    VIF_MODEL_SPAPR_VLAN,
+    VIF_MODEL_SRIOV,
+    VIF_MODEL_VMXNET,
+    VIF_MODEL_VMXNET3,
+)
 
 # Constant for max length of network interface names
 # eg 'bridge' in the Network class or 'devname' in
@@ -270,7 +333,8 @@ class VIF(Model):
     def __init__(self, id=None, address=None, network=None, type=None,
                  details=None, devname=None, ovs_interfaceid=None,
                  qbh_params=None, qbg_params=None, active=False,
-                 **kwargs):
+                 vnic_type=VNIC_TYPE_NORMAL, profile=None,
+                 preserve_on_delete=False, **kwargs):
         super(VIF, self).__init__()
 
         self['id'] = id
@@ -284,13 +348,17 @@ class VIF(Model):
         self['qbh_params'] = qbh_params
         self['qbg_params'] = qbg_params
         self['active'] = active
+        self['vnic_type'] = vnic_type
+        self['profile'] = profile
+        self['preserve_on_delete'] = preserve_on_delete
 
         self._set_meta(kwargs)
 
     def __eq__(self, other):
-        keys = ['id', 'address', 'network', 'type', 'details', 'devname',
+        keys = ['id', 'address', 'network', 'vnic_type',
+                'type', 'profile', 'details', 'devname',
                 'ovs_interfaceid', 'qbh_params', 'qbg_params',
-                'active']
+                'active', 'preserve_on_delete']
         return all(self[k] == other[k] for k in keys)
 
     def __ne__(self, other):
@@ -339,10 +407,16 @@ class VIF(Model):
         return []
 
     def is_hybrid_plug_enabled(self):
-        return self['details'].get(VIF_DETAIL_OVS_HYBRID_PLUG, False)
+        return self['details'].get(VIF_DETAILS_OVS_HYBRID_PLUG, False)
 
     def is_neutron_filtering_enabled(self):
-        return self['details'].get(VIF_DETAIL_PORT_FILTER, False)
+        return self['details'].get(VIF_DETAILS_PORT_FILTER, False)
+
+    def get_physical_network(self):
+        phy_network = self['network']['meta'].get('physical_network')
+        if not phy_network:
+            phy_network = self['details'].get(VIF_DETAILS_PHYSICAL_NETWORK)
+        return phy_network
 
     @classmethod
     def hydrate(cls, vif):

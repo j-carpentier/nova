@@ -12,9 +12,16 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+# NOTE: XenServer still only supports Python 2.4 in it's dom0 userspace
+# which means the Nova xenapi plugins must use only Python 2.4 features
+
 """Various utilities used by XenServer plugins."""
 
-import cPickle as pickle
+try:
+    import cPickle as pickle
+except ImportError:
+    import pickle
+
 import errno
 import logging
 import os
@@ -101,6 +108,10 @@ def finish_subprocess(proc, cmdline, cmd_input=None, ok_exit_codes=None):
 
     ret = proc.returncode
     if ret not in ok_exit_codes:
+        LOG.error("Command '%(cmdline)s' with process id '%(pid)s' expected "
+                  "return code in '%(ok)s' but got '%(rc)s': %(err)s" %
+                  {'cmdline': cmdline, 'pid': proc.pid, 'ok': ok_exit_codes,
+                   'rc': ret, 'err': err})
         raise SubprocessException(' '.join(cmdline), ret, out, err)
     return out
 
@@ -196,6 +207,15 @@ def _handle_old_style_images(staging_path):
             _rename(path, os.path.join(staging_path, "%d.vhd" % file_num))
             file_num += 1
 
+    # Rename any format of name to 0.vhd when there is only single one
+    contents = os.listdir(staging_path)
+    if len(contents) == 1:
+        filename = contents[0]
+        if filename != '0.vhd' and filename.endswith('.vhd'):
+            _rename(
+                os.path.join(staging_path, filename),
+                os.path.join(staging_path, '0.vhd'))
+
 
 def _assert_vhd_not_hidden(path):
     """Sanity check to ensure that only appropriate VHDs are marked as hidden.
@@ -214,6 +234,13 @@ def _assert_vhd_not_hidden(path):
                     "VHD %s is marked as hidden without child" % path)
 
 
+def _vhd_util_check(vdi_path):
+    check_cmd = ["vhd-util", "check", "-n", vdi_path, "-p"]
+    out = run_command(check_cmd, ok_exit_codes=[0, 22])
+    first_line = out.splitlines()[0].strip()
+    return out, first_line
+
+
 def _validate_vhd(vdi_path):
     """This checks for several errors in the VHD structure.
 
@@ -225,9 +252,13 @@ def _validate_vhd(vdi_path):
     Dom0's are out-of-sync. This would corrupt the SR if it were imported, so
     generate an exception to bail.
     """
-    check_cmd = ["vhd-util", "check", "-n", vdi_path, "-p"]
-    out = run_command(check_cmd, ok_exit_codes=[0, 22])
-    first_line = out.splitlines()[0].strip()
+    out, first_line = _vhd_util_check(vdi_path)
+
+    if 'invalid' in first_line:
+        LOG.warning("VHD invalid, attempting repair.")
+        repair_cmd = ["vhd-util", "repair", "-n", vdi_path]
+        run_command(repair_cmd)
+        out, first_line = _vhd_util_check(vdi_path)
 
     if 'invalid' in first_line:
         if 'footer' in first_line:
@@ -254,6 +285,8 @@ def _validate_vhd(vdi_path):
             "VDI '%(vdi_path)s' has an invalid %(part)s: '%(details)s'"
             "%(extra)s" % {'vdi_path': vdi_path, 'part': part,
                            'details': details, 'extra': extra})
+
+    LOG.info("VDI is valid: %s" % vdi_path)
 
 
 def _validate_vdi_chain(vdi_path):

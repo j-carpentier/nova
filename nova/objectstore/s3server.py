@@ -38,15 +38,21 @@ import os
 import os.path
 import urllib
 
-from oslo.config import cfg
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_log import versionutils
+from oslo_utils import fileutils
 import routes
 import six
 import webob
 
-from nova.openstack.common import fileutils
+from nova.i18n import _LW
 from nova import paths
 from nova import utils
 from nova import wsgi
+
+
+LOG = logging.getLogger(__name__)
 
 
 s3_opts = [
@@ -58,6 +64,8 @@ s3_opts = [
                help='IP address for S3 API to listen'),
     cfg.IntOpt('s3_listen_port',
                default=3333,
+               min=1,
+               max=65535,
                help='Port for S3 API to listen'),
 ]
 
@@ -82,6 +90,13 @@ class S3Application(wsgi.Router):
     """
 
     def __init__(self, root_directory, bucket_depth=0, mapper=None):
+        versionutils.report_deprecated_feature(
+            LOG,
+            _LW('The in tree EC2 API is deprecated as of Kilo release and may '
+                'be removed in a future release. The stackforge ec2-api '
+                'project http://git.openstack.org/cgit/stackforge/ec2-api/ '
+                'is the target replacement for this functionality.')
+        )
         if mapper is None:
             mapper = routes.Mapper()
 
@@ -189,7 +204,7 @@ class BaseRequestHandler(object):
         elif isinstance(value, datetime.datetime):
             parts.append(value.strftime("%Y-%m-%dT%H:%M:%S.000Z"))
         elif isinstance(value, dict):
-            for name, subvalue in value.iteritems():
+            for name, subvalue in six.iteritems(value):
                 if not isinstance(subvalue, list):
                     subvalue = [subvalue]
                 for subsubvalue in subvalue:

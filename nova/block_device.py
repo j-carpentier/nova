@@ -15,12 +15,13 @@
 
 import re
 
-from oslo.config import cfg
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_utils import strutils
+import six
 
 from nova import exception
-from nova.openstack.common.gettextutils import _
-from nova.openstack.common import log as logging
-from nova.openstack.common import strutils
+from nova.i18n import _
 from nova import utils
 from nova.virt import driver
 
@@ -75,22 +76,25 @@ class BlockDeviceDict(dict):
 
     _required_fields = set(['source_type'])
 
-    def __init__(self, bdm_dict=None, do_not_default=None):
+    def __init__(self, bdm_dict=None, do_not_default=None, **kwargs):
         super(BlockDeviceDict, self).__init__()
 
         bdm_dict = bdm_dict or {}
+        bdm_dict.update(kwargs)
         do_not_default = do_not_default or set()
 
         self._validate(bdm_dict)
+        if bdm_dict.get('device_name'):
+            bdm_dict['device_name'] = prepend_dev(bdm_dict['device_name'])
+        bdm_dict['delete_on_termination'] = bool(
+            bdm_dict.get('delete_on_termination'))
         # NOTE (ndipanov): Never default db fields
-        self.update(
-            dict((field, None)
-                 for field in self._fields - do_not_default))
-        self.update(list(bdm_dict.iteritems()))
+        self.update({field: None for field in self._fields - do_not_default})
+        self.update(list(six.iteritems(bdm_dict)))
 
     def _validate(self, bdm_dict):
         """Basic data format validations."""
-        dict_fields = set(key for key, _ in bdm_dict.iteritems())
+        dict_fields = set(key for key, _ in six.iteritems(bdm_dict))
 
         # Check that there are no bogus fields
         if not (dict_fields <=
@@ -136,8 +140,8 @@ class BlockDeviceDict(dict):
         non_computable_fields = set(['boot_index', 'disk_bus',
                                      'guest_format', 'device_type'])
 
-        new_bdm = dict((fld, val) for fld, val in legacy_bdm.iteritems()
-                        if fld in copy_over_fields)
+        new_bdm = {fld: val for fld, val in six.iteritems(legacy_bdm)
+                   if fld in copy_over_fields}
 
         virt_name = legacy_bdm.get('virtual_name')
 
@@ -170,7 +174,7 @@ class BlockDeviceDict(dict):
         return cls(new_bdm, non_computable_fields)
 
     @classmethod
-    def from_api(cls, api_dict):
+    def from_api(cls, api_dict, image_uuid_specified):
         """Transform the API format of data to the internally used one.
 
         Only validate if the source_type field makes sense.
@@ -179,15 +183,30 @@ class BlockDeviceDict(dict):
 
             source_type = api_dict.get('source_type')
             device_uuid = api_dict.get('uuid')
+            destination_type = api_dict.get('destination_type')
 
             if source_type not in ('volume', 'image', 'snapshot', 'blank'):
                 raise exception.InvalidBDMFormat(
                     details=_("Invalid source_type field."))
+            elif source_type == 'blank' and device_uuid:
+                raise exception.InvalidBDMFormat(
+                    details=_("Invalid device UUID."))
             elif source_type != 'blank':
                 if not device_uuid:
                     raise exception.InvalidBDMFormat(
                         details=_("Missing device UUID."))
                 api_dict[source_type + '_id'] = device_uuid
+            if source_type == 'image' and destination_type == 'local':
+                try:
+                    boot_index = int(api_dict.get('boot_index', -1))
+                except ValueError:
+                    raise exception.InvalidBDMFormat(
+                        details=_("Boot index is invalid."))
+                # if this bdm is generated from --image ,then
+                # source_type = image and destination_type = local is allowed
+                if not (image_uuid_specified and boot_index == 0):
+                    raise exception.InvalidBDMFormat(
+                        details=_("Mapping image to local is not supported."))
 
         api_dict.pop('uuid', None)
         return cls(api_dict)
@@ -197,8 +216,8 @@ class BlockDeviceDict(dict):
         copy_over_fields |= (bdm_db_only_fields |
                              bdm_db_inherited_fields)
 
-        legacy_block_device = dict((field, self.get(field))
-            for field in copy_over_fields if field in self)
+        legacy_block_device = {field: self.get(field)
+            for field in copy_over_fields if field in self}
 
         source_type = self.get('source_type')
         destination_type = self.get('destination_type')
@@ -222,7 +241,7 @@ class BlockDeviceDict(dict):
         return legacy_block_device
 
     def get_image_mapping(self):
-        drop_fields = (set(['connection_info', 'device_name']) |
+        drop_fields = (set(['connection_info']) |
                        self._db_only_fields)
         mapping_dict = dict(self)
         for fld in drop_fields:
@@ -258,10 +277,23 @@ def create_image_bdm(image_ref, boot_index=0):
          'destination_type': 'local'})
 
 
+def create_blank_bdm(size, guest_format=None):
+    return BlockDeviceDict(
+        {'source_type': 'blank',
+         'delete_on_termination': True,
+         'device_type': 'disk',
+         'boot_index': -1,
+         'destination_type': 'local',
+         'guest_format': guest_format,
+         'volume_size': size})
+
+
 def snapshot_from_bdm(snapshot_id, template):
     """Create a basic volume snapshot BDM from a given template bdm."""
 
-    copy_from_template = ['disk_bus', 'device_type', 'boot_index']
+    copy_from_template = ('disk_bus', 'device_type', 'boot_index',
+                          'delete_on_termination', 'volume_size',
+                          'device_name')
     snapshot_dict = {'source_type': 'snapshot',
                      'destination_type': 'volume',
                      'snapshot_id': snapshot_id}
@@ -378,6 +410,9 @@ def validate_and_default_volume_size(bdm):
             bdm['volume_size'] = utils.validate_integer(
                 bdm['volume_size'], 'volume_size', min_value=0)
         except exception.InvalidInput:
+            # NOTE: We can remove this validation code after removing
+            # Nova v2.0 API code because v2.1 API validates this case
+            # already at its REST API layer.
             raise exception.InvalidBDMFormat(
                 details=_("Invalid volume_size."))
 
@@ -408,17 +443,26 @@ def new_format_is_swap(bdm):
 
 
 def new_format_is_ephemeral(bdm):
-    if (bdm.get('source_type') == 'blank' and not
-            new_format_is_swap(bdm)):
+    if (bdm.get('source_type') == 'blank' and
+            bdm.get('destination_type') == 'local' and
+            bdm.get('guest_format') != 'swap'):
         return True
     return False
 
 
 def get_root_bdm(bdms):
     try:
-        return (bdm for bdm in bdms if bdm.get('boot_index', -1) == 0).next()
+        return next(bdm for bdm in bdms if bdm.get('boot_index', -1) == 0)
     except StopIteration:
         return None
+
+
+def get_bdms_to_connect(bdms, exclude_root_mapping=False):
+    """Will return non-root mappings, when exclude_root_mapping is true.
+       Otherwise all mappings will be returned.
+    """
+    return (bdm for bdm in bdms if bdm.get('boot_index', -1) != 0 or
+            not exclude_root_mapping)
 
 
 def mappings_prepend_dev(mappings):
@@ -444,13 +488,23 @@ def prepend_dev(device_name):
     return device_name and '/dev/' + strip_dev(device_name)
 
 
-_pref = re.compile('^((x?v|s)d)')
+_pref = re.compile('^((x?v|s|h)d)')
 
 
 def strip_prefix(device_name):
-    """remove both leading /dev/ and xvd or sd or vd."""
+    """remove both leading /dev/ and xvd or sd or vd or hd."""
     device_name = strip_dev(device_name)
     return _pref.sub('', device_name)
+
+
+_nums = re.compile('\d+')
+
+
+def get_device_letter(device_name):
+    letter = strip_prefix(device_name)
+    # NOTE(vish): delete numbers in case we have something like
+    #             /dev/sda1
+    return _nums.sub('', letter)
 
 
 def instance_block_mapping(instance, bdms):

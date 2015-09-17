@@ -13,14 +13,15 @@
 #    under the License.
 
 
-import json
 import os
 import time
 
-from nova.openstack.common.gettextutils import _
-from nova.openstack.common import log as logging
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_serialization import jsonutils
+
+from nova.i18n import _LW
 from nova import utils
-from oslo.config import cfg
 
 LOG = logging.getLogger(__name__)
 
@@ -37,13 +38,14 @@ TWENTY_FOUR_HOURS = 3600 * 24
 # synchronize and the implications of how decorators wrap the wrapped function
 # or method.  If this needs to be used outside of compute.manager, it should
 # be refactored to eliminate this circular dependency loop.
+# config option import is avoided here since it is
+# explicitly imported from compute.manager and may cause issues with
+# defining options after config has been processed with the
+# wrapped-function style used here.
+
 def register_storage_use(storage_path, hostname):
     """Identify the id of this instance storage."""
 
-    # NOTE(morganfainberg): config option import is avoided here since it is
-    # explicitly imported from compute.manager and may cause issues with
-    # defining options after config has been processed with the
-    # wrapped-function style used here.
     LOCK_PATH = os.path.join(CONF.instances_path, 'locks')
 
     @utils.synchronized('storage-registry-lock', external=True,
@@ -58,34 +60,24 @@ def register_storage_use(storage_path, hostname):
         if os.path.exists(id_path):
             with open(id_path) as f:
                 try:
-                    d = json.loads(f.read())
+                    d = jsonutils.loads(f.read())
                 except ValueError:
-                    LOG.warning(_("Cannot decode JSON from %(id_path)s"),
+                    LOG.warning(_LW("Cannot decode JSON from %(id_path)s"),
                                 {"id_path": id_path})
 
         d[hostname] = time.time()
 
         with open(id_path, 'w') as f:
-            f.write(json.dumps(d))
+            f.write(jsonutils.dumps(d))
 
     return do_register_storage_use(storage_path, hostname)
 
 
-# NOTE(morganfainberg): Due to circular import dependencies, the use of the
-# CONF.instances_path needs to be wrapped so that it can be resolved at the
-# appropriate time. Because compute.manager imports this file, we end up in
-# a rather ugly dependency loop without moving this into a wrapped function.
-# This issue mostly stems from the use of a decorator for the lock
-# synchronize and the implications of how decorators wrap the wrapped function
-# or method.  If this needs to be used outside of compute.manager, it should
-# be refactored to eliminate this circular dependency loop.
 def get_storage_users(storage_path):
     """Get a list of all the users of this storage path."""
 
-    # NOTE(morganfainberg): config option import is avoided here since it is
-    # explicitly imported from compute.manager and may cause issues with
-    # defining options after config has been processed with the
-    # wrapped-function style used here.
+    # See comments above method register_storage_use
+
     LOCK_PATH = os.path.join(CONF.instances_path, 'locks')
 
     @utils.synchronized('storage-registry-lock', external=True,
@@ -96,9 +88,9 @@ def get_storage_users(storage_path):
         if os.path.exists(id_path):
             with open(id_path) as f:
                 try:
-                    d = json.loads(f.read())
+                    d = jsonutils.loads(f.read())
                 except ValueError:
-                    LOG.warning(_("Cannot decode JSON from %(id_path)s"),
+                    LOG.warning(_LW("Cannot decode JSON from %(id_path)s"),
                                 {"id_path": id_path})
 
         recent_users = []

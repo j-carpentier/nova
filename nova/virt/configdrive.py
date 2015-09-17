@@ -17,16 +17,17 @@
 
 import os
 import shutil
-import tempfile
 
-from nova.openstack.common import strutils
-from oslo.config import cfg
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_utils import fileutils
+from oslo_utils import strutils
+from oslo_utils import units
 
 from nova import exception
-from nova.openstack.common import fileutils
-from nova.openstack.common.gettextutils import _
-from nova.openstack.common import log as logging
-from nova.openstack.common import units
+from nova.i18n import _LW
+from nova import objects
+from nova.objects import fields
 from nova import utils
 from nova import version
 
@@ -35,16 +36,15 @@ LOG = logging.getLogger(__name__)
 configdrive_opts = [
     cfg.StrOpt('config_drive_format',
                default='iso9660',
-               help='Config drive format. One of iso9660 (default) or vfat'),
-    cfg.StrOpt('config_drive_tempdir',
-               default=tempfile.tempdir,
-               help=('Where to put temporary files associated with '
-                     'config drive creation')),
+               choices=('iso9660', 'vfat'),
+               help='Config drive format.'),
     # force_config_drive is a string option, to allow for future behaviors
     #  (e.g. use config_drive based on image properties)
     cfg.StrOpt('force_config_drive',
-               help='Set to force injection to take place on a config drive '
-                    '(if set, valid options are: always)'),
+               choices=('always', 'True', 'False'),
+               help='Set to "always" to force injection to take place on a '
+                    'config drive. NOTE: The "always" will be deprecated in '
+                    'the Liberty release cycle.'),
     cfg.StrOpt('mkisofs_cmd',
                default='genisoimage',
                help='Name and optionally path of the tool used for '
@@ -62,13 +62,11 @@ class ConfigDriveBuilder(object):
     """Build config drives, optionally as a context manager."""
 
     def __init__(self, instance_md=None):
+        if CONF.force_config_drive == 'always':
+            LOG.warning(_LW('The setting "always" will be deprecated in the '
+                            'Liberty version. Please use "True" instead'))
         self.imagefile = None
-
-        # TODO(mikal): I don't think I can use utils.tempdir here, because
-        # I need to have the directory last longer than the scope of this
-        # method call
-        self.tempdir = tempfile.mkdtemp(dir=CONF.config_drive_tempdir,
-                                        prefix='cd_gen_')
+        self.mdfiles = []
 
         if instance_md is not None:
             self.add_instance_metadata(instance_md)
@@ -84,20 +82,22 @@ class ConfigDriveBuilder(object):
             return False
         self.cleanup()
 
-    def _add_file(self, path, data):
-        filepath = os.path.join(self.tempdir, path)
+    def _add_file(self, basedir, path, data):
+        filepath = os.path.join(basedir, path)
         dirname = os.path.dirname(filepath)
         fileutils.ensure_tree(dirname)
         with open(filepath, 'wb') as f:
             f.write(data)
 
     def add_instance_metadata(self, instance_md):
-        for (path, value) in instance_md.metadata_for_config_drive():
-            self._add_file(path, value)
-            LOG.debug('Added %(filepath)s to config drive',
-                      {'filepath': path})
+        for (path, data) in instance_md.metadata_for_config_drive():
+            self.mdfiles.append((path, data))
 
-    def _make_iso9660(self, path):
+    def _write_md_files(self, basedir):
+        for data in self.mdfiles:
+            self._add_file(basedir, data[0], data[1])
+
+    def _make_iso9660(self, path, tmpdir):
         publisher = "%(product)s %(version)s" % {
             'product': version.product_string(),
             'version': version.version_string_with_package()
@@ -115,11 +115,11 @@ class ConfigDriveBuilder(object):
                       '-J',
                       '-r',
                       '-V', 'config-2',
-                      self.tempdir,
+                      tmpdir,
                       attempts=1,
                       run_as_root=False)
 
-    def _make_vfat(self, path):
+    def _make_vfat(self, path, tmpdir):
         # NOTE(mikal): This is a little horrible, but I couldn't find an
         # equivalent to genisoimage for vfat filesystems.
         with open(path, 'wb') as f:
@@ -127,30 +127,30 @@ class ConfigDriveBuilder(object):
 
         utils.mkfs('vfat', path, label='config-2')
 
-        mounted = False
-        try:
-            mountdir = tempfile.mkdtemp(dir=CONF.config_drive_tempdir,
-                                        prefix='cd_mnt_')
-            _out, err = utils.trycmd('mount', '-o',
-                                     'loop,uid=%d,gid=%d' % (os.getuid(),
-                                                             os.getgid()),
-                                     path, mountdir,
-                                     run_as_root=True)
-            if err:
-                raise exception.ConfigDriveMountFailed(operation='mount',
-                                                       error=err)
-            mounted = True
+        with utils.tempdir() as mountdir:
+            mounted = False
+            try:
+                _, err = utils.trycmd(
+                    'mount', '-o', 'loop,uid=%d,gid=%d' % (os.getuid(),
+                                                           os.getgid()),
+                    path,
+                    mountdir,
+                    run_as_root=True)
+                if err:
+                    raise exception.ConfigDriveMountFailed(operation='mount',
+                                                           error=err)
+                mounted = True
 
-            # NOTE(mikal): I can't just use shutils.copytree here, because the
-            # destination directory already exists. This is annoying.
-            for ent in os.listdir(self.tempdir):
-                shutil.copytree(os.path.join(self.tempdir, ent),
-                                os.path.join(mountdir, ent))
+                # NOTE(mikal): I can't just use shutils.copytree here,
+                # because the destination directory already
+                # exists. This is annoying.
+                for ent in os.listdir(tmpdir):
+                    shutil.copytree(os.path.join(tmpdir, ent),
+                                    os.path.join(mountdir, ent))
 
-        finally:
-            if mounted:
-                utils.execute('umount', mountdir, run_as_root=True)
-            shutil.rmtree(mountdir)
+            finally:
+                if mounted:
+                    utils.execute('umount', mountdir, run_as_root=True)
 
     def make_drive(self, path):
         """Make the config drive.
@@ -159,25 +159,45 @@ class ConfigDriveBuilder(object):
 
         :raises ProcessExecuteError if a helper process has failed.
         """
-        if CONF.config_drive_format == 'iso9660':
-            self._make_iso9660(path)
-        elif CONF.config_drive_format == 'vfat':
-            self._make_vfat(path)
-        else:
-            raise exception.ConfigDriveUnknownFormat(
-                format=CONF.config_drive_format)
+        with utils.tempdir() as tmpdir:
+            self._write_md_files(tmpdir)
+
+            if CONF.config_drive_format == 'iso9660':
+                self._make_iso9660(path, tmpdir)
+            elif CONF.config_drive_format == 'vfat':
+                self._make_vfat(path, tmpdir)
+            else:
+                raise exception.ConfigDriveUnknownFormat(
+                    format=CONF.config_drive_format)
 
     def cleanup(self):
         if self.imagefile:
             fileutils.delete_if_exists(self.imagefile)
 
-        try:
-            shutil.rmtree(self.tempdir)
-        except OSError as e:
-            LOG.error(_('Could not remove tmpdir: %s'), str(e))
+    def __repr__(self):
+        return "<ConfigDriveBuilder: " + str(self.mdfiles) + ">"
 
 
 def required_by(instance):
+    image_meta = objects.ImageMeta.from_instance(instance)
+
+    image_prop = image_meta.properties.get(
+        "img_config_drive",
+        fields.ConfigDrivePolicy.OPTIONAL)
+
     return (instance.get('config_drive') or
             'always' == CONF.force_config_drive or
-            strutils.bool_from_string(CONF.force_config_drive))
+            strutils.bool_from_string(CONF.force_config_drive) or
+            image_prop == fields.ConfigDrivePolicy.MANDATORY
+            )
+
+
+def update_instance(instance):
+    """Update the instance config_drive setting if necessary
+
+    The image or configuration file settings may override the default instance
+    setting. In this case the instance needs to mirror the actual
+    virtual machine configuration.
+    """
+    if not instance.config_drive and required_by(instance):
+        instance.config_drive = True

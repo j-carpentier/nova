@@ -13,20 +13,19 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import pkg_resources
-
-from oslo.config import cfg
+from oslo_config import cfg
+from oslo_log import log as logging
 import six.moves.urllib.parse as urlparse
 
-from nova.openstack.common.gettextutils import _
-import nova.openstack.common.log as logging
+from nova.i18n import _, _LW
 from nova.virt.xenapi import vm_utils
 
 LOG = logging.getLogger(__name__)
 
 xenapi_torrent_opts = [
     cfg.StrOpt('torrent_base_url',
-               help='Base URL for torrent files.'),
+               help='Base URL for torrent files; must contain a slash'
+                    ' character (see RFC 1808, step 6)'),
     cfg.FloatOpt('torrent_seed_chance',
                  default=1.0,
                  help='Probability that peer will become a seeder.'
@@ -41,9 +40,13 @@ xenapi_torrent_opts = [
                     ' seconds can be reaped'),
     cfg.IntOpt('torrent_listen_port_start',
                default=6881,
+               min=1,
+               max=65535,
                help='Beginning of port range to listen on'),
     cfg.IntOpt('torrent_listen_port_end',
                default=6891,
+               min=1,
+               max=65535,
                help='End of port range to listen on'),
     cfg.IntOpt('torrent_download_stall_cutoff',
                default=600,
@@ -62,37 +65,28 @@ CONF.register_opts(xenapi_torrent_opts, 'xenserver')
 class BittorrentStore(object):
     @staticmethod
     def _lookup_torrent_url_fn():
-        """Load a "fetcher" func to get the right torrent URL via
-        entrypoints.
+        """Load a "fetcher" func to get the right torrent URL.
         """
 
         if CONF.xenserver.torrent_base_url:
+            if '/' not in CONF.xenserver.torrent_base_url:
+                LOG.warn(_LW('Value specified in conf file for'
+                             ' xenserver.torrent_base_url does not contain a'
+                             ' slash character, therefore it will not be used'
+                             ' as part of the torrent URL. Specify a valid'
+                             ' base URL as defined by RFC 1808 (see step 6).'))
+
             def _default_torrent_url_fn(image_id):
                 return urlparse.urljoin(CONF.xenserver.torrent_base_url,
                                         "%s.torrent" % image_id)
 
             return _default_torrent_url_fn
 
-        matches = [ep for ep in
-                   pkg_resources.iter_entry_points('nova.virt.xenapi.vm_utils')
-                   if ep.name == 'torrent_url']
+        raise RuntimeError(_('Cannot create default bittorrent URL'
+                             ' without xenserver.torrent_base_url'
+                             ' configuration option set.'))
 
-        if not matches:
-            raise RuntimeError(_('Cannot create default bittorrent URL'
-                                 ' without torrent_base_url set or'
-                                 ' torrent URL fetcher extension'))
-        elif len(matches) > 1:
-            raise RuntimeError(_("Multiple torrent URL fetcher extensions"
-                                 " found. Failing."))
-        else:
-            ep = matches[0]
-            LOG.debug("Loading torrent URL fetcher from entry points"
-                      " %(ep)s", {'ep': ep})
-            fn = ep.load()
-
-        return fn
-
-    def download_image(self, context, session, image_id):
+    def download_image(self, context, session, instance, image_id):
         params = {}
         params['image_id'] = image_id
         params['uuid_stack'] = vm_utils._make_uuid_stack()
@@ -118,5 +112,5 @@ class BittorrentStore(object):
 
         return vdis
 
-    def upload_image(self, context, session, instance, vdi_uuids, image_id):
+    def upload_image(self, context, session, instance, image_id, vdi_uuids):
         raise NotImplementedError
